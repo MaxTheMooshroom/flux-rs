@@ -20,6 +20,7 @@ pub const EXIT_ERR: i32 = -1;
 pub const FLUX_SYSROOT: &str = "FLUX_SYSROOT";
 
 const FLUX_DRIVER: &str = "FLUX_DRIVER";
+const CARGO: &str = "CARGO";
 
 /// The path of the flux sysroot lib containing precompiled libraries and the flux driver.
 pub fn flux_sysroot_dir() -> PathBuf {
@@ -81,6 +82,14 @@ pub fn get_binary_path(toolchain: &str, bin: &str) -> anyhow::Result<PathBuf> {
             .trim()
             .to_string(),
     ))
+}
+
+pub fn get_cargo_path(toolchain: &str) -> anyhow::Result<PathBuf> {
+    if let Some(path) = env::var_os(CARGO) {
+        Ok(PathBuf::from(path))
+    } else {
+        get_binary_path(toolchain, "cargo")
+    }
 }
 
 pub fn get_rust_sysroot(toolchain: &str) -> Result<PathBuf> {

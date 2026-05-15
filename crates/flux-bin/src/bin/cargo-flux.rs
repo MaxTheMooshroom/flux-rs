@@ -11,7 +11,7 @@ use flux_bin::{
     FluxMetadata,
     cargo_flux_opts::{CargoFluxCommand, Cli},
     utils::{
-        EXIT_ERR, flux_sysroot_dir, get_binary_path, get_flux_driver_path, get_rust_toolchain,
+        EXIT_ERR, flux_sysroot_dir, get_cargo_path, get_flux_driver_path, get_rust_toolchain,
         print_version_and_exit,
     },
 };
@@ -39,7 +39,7 @@ fn main() {
 
 fn run(cargo_flux_cmd: CargoFluxCommand) -> anyhow::Result<i32> {
     let toolchain = get_rust_toolchain()?;
-    let cargo_path = get_binary_path(&toolchain, "cargo")?;
+    let cargo_path = get_cargo_path(&toolchain)?;
 
     let metadata = cargo_flux_cmd.metadata().cargo_path(&cargo_path).exec()?;
     let config_file = write_cargo_config(metadata)?;
