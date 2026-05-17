@@ -38,7 +38,7 @@ fn main() {
 }
 
 fn run(cargo_flux_cmd: CargoFluxCommand) -> anyhow::Result<i32> {
-    let toolchain = get_rust_toolchain()?;
+    let toolchain = get_rust_toolchain();
     let cargo_path = get_cargo_path(&toolchain)?;
 
     let metadata = cargo_flux_cmd.metadata().cargo_path(&cargo_path).exec()?;
@@ -55,8 +55,7 @@ fn run(cargo_flux_cmd: CargoFluxCommand) -> anyhow::Result<i32> {
     // conflicts, e.g., see https://github.com/flux-rs/flux/issues/1155
     cargo_command
         .env("RUSTC", flux_driver_path)
-        .env("RUSTC_WRAPPER", "")
-        .arg(format!("+{toolchain}"));
+        .env("RUSTC_WRAPPER", "");
 
     cargo_flux_cmd.forward_args(&mut cargo_command, config_file.path());
 
