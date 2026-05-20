@@ -47,7 +47,7 @@ fn run(cargo_flux_cmd: CargoFluxCommand) -> anyhow::Result<i32> {
     let sysroot = flux_sysroot_dir();
     let flux_driver_path = get_flux_driver_path(&sysroot)?;
 
-    let mut cargo_command = Command::new("cargo");
+    let mut cargo_command = Command::new(cargo_path);
 
     // We set `RUSTC` as an environment variable and not in in the [build]
     // section of the config file to make sure we run flux even when the
