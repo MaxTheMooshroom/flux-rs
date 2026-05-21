@@ -28,6 +28,13 @@ fn get_rust_toolchain_commit_info(toolchain: &str) -> String {
 
     match (env::var_os(SANDBOXED), env::var_os(VERSION_OVERRIDE)) {
         (Some(_), Some(version)) => version.into_string().unwrap(),
+        (Some(_), None) => {
+            let manifest_url = Toolchain::from_str(toolchain)
+                .unwrap_or_else(|_| panic!("Invalid toolchain string: {}", toolchain))
+                .manifest_url();
+
+            panic!("SANDBOXED was set but no override was provided!\nManifest URL:\n{manifest_url}");
+        },
         _ => {
             let manifest_url = Toolchain::from_str(toolchain)
                 .unwrap_or_else(|_| panic!("Invalid toolchain string: {}", toolchain))
