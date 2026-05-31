@@ -42,10 +42,9 @@ fn run(cargo_flux_cmd: CargoFluxCommand) -> anyhow::Result<i32> {
     let cargo_path = get_cargo_path(&toolchain)?;
 
     let metadata = cargo_flux_cmd.metadata().cargo_path(&cargo_path).exec()?;
-    let config_file = write_cargo_config(metadata)?;
-
     let sysroot = flux_sysroot_dir();
     let flux_driver_path = get_flux_driver_path(&sysroot)?;
+    let config_file = write_cargo_config(metadata, &sysroot)?;
 
     let mut cargo_command = Command::new(cargo_path);
 
@@ -62,7 +61,10 @@ fn run(cargo_flux_cmd: CargoFluxCommand) -> anyhow::Result<i32> {
     Ok(cargo_command.status()?.code().unwrap_or(EXIT_ERR))
 }
 
-fn write_cargo_config(metadata: Metadata) -> anyhow::Result<NamedTempFile> {
+fn write_cargo_config(
+    metadata: Metadata,
+    sysroot: &std::path::Path,
+) -> anyhow::Result<NamedTempFile> {
     let flux_flags: Option<Vec<String>> = if let Ok(flags) = env::var("FLUXFLAGS") {
         Some(flags.split(" ").map(Into::into).collect())
     } else {
@@ -115,6 +117,7 @@ incremental = false
                     .strip_prefix(&metadata.workspace_root)
                     .ok()
                     .and_then(Utf8Path::parent);
+                let sysroot_flag = format!("-Fsysroot={}", sysroot.display());
                 write!(
                     w,
                     r#"
@@ -127,7 +130,7 @@ rustflags = [{:?}]
                         .iter()
                         .chain(flux_flags.iter().flatten())
                         .map(|s| s.as_ref())
-                        .chain(["-Fverify=on", "-Ffull-compilation=on"])
+                        .chain(["-Fverify=on", "-Ffull-compilation=on", sysroot_flag.as_str()])
                         .format(", ")
                 )?;
             }

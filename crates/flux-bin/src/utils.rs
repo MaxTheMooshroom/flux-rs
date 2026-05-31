@@ -14,24 +14,35 @@ pub const LIB_PATH: &str = "LD_LIBRARY_PATH";
 #[cfg(target_os = "macos")]
 pub const LIB_PATH: &str = "DYLD_FALLBACK_LIBRARY_PATH";
 
-pub const EXIT_ERR: i32 = -1;
+pub use flux_sysroot::{FLUX_SYSROOT, flux_sysroot_dir};
 
-pub const FLUX_SYSROOT: &str = "FLUX_SYSROOT";
+pub const EXIT_ERR: i32 = -1;
 
 const FLUX_DRIVER: &str = "FLUX_DRIVER";
 const CARGO: &str = "CARGO";
 
-/// The path of the flux sysroot lib containing precompiled libraries and the flux driver.
-pub fn flux_sysroot_dir() -> PathBuf {
-    env::var_os(FLUX_SYSROOT).map_or_else(default_flux_sysroot_dir, PathBuf::from)
-}
-
-/// Return the default sysroot
-fn default_flux_sysroot_dir() -> PathBuf {
-    home::home_dir()
-        .expect("Couldn't find home directory")
-        .join(".flux")
-}
+// <<<<<<< HEAD
+// /// The path of the flux sysroot lib containing precompiled libraries and the flux driver.
+// pub fn flux_sysroot_dir() -> PathBuf {
+//     env::var_os(FLUX_SYSROOT).map_or_else(default_flux_sysroot_dir, PathBuf::from)
+// }
+//
+// /// Return the default sysroot
+// fn default_flux_sysroot_dir() -> PathBuf {
+//     home::home_dir()
+//         .expect("Couldn't find home directory")
+//         .join(".flux")
+// =======
+// #[derive(Deserialize)]
+// pub struct ToolchainToml {
+//     toolchain: ToolchainSpec,
+// }
+//
+// #[derive(Deserialize)]
+// pub struct ToolchainSpec {
+//     channel: String,
+// >>>>>>> upstream/main
+// }
 
 pub fn get_flux_driver_path(sysroot: &Path) -> Result<PathBuf> {
     let path = if let Some(path) = env::var_os(FLUX_DRIVER) {
