@@ -19,11 +19,12 @@ use flux_middle::{
     queries::{QueryResult, try_query},
     query_bug,
     rty::{
-        self, AdtDef, BaseTy, Binder, Bool, Clause, Constant, CoroutineObligPredicate, EarlyBinder,
-        Expr, FnOutput, FnSig, FnTraitPredicate, GenericArg, GenericArgsExt as _, Int, IntTy,
-        Mutability, Path, PolyFnSig, PtrKind, RefineArgs, RefineArgsExt,
+        self, AdtDef, AliasReft, BaseTy, BinOp, Binder, Bool, Clause, Constant,
+        CoroutineObligPredicate, EarlyBinder, Expr, FnOutput, FnSig, FnTraitPredicate, GenericArg,
+        GenericArgsExt as _, Int, IntTy, Mutability, Path, PolyFnSig, PtrKind, RefineArgs,
+        RefineArgsExt,
         Region::ReErased,
-        Ty, TyKind, Uint, UintTy, VariantIdx,
+        Sort, SubsetTyCtor, Ty, TyKind, Uint, UintTy, VariantIdx,
         fold::{TypeFoldable, TypeFolder, TypeSuperFoldable},
         refining::{Refine, Refiner},
     },
@@ -54,12 +55,13 @@ use rustc_middle::{
     ty::{TyCtxt, TypeSuperVisitable as _, TypeVisitable as _, TypingMode},
 };
 use rustc_span::{
-    Span, Symbol,
+    DUMMY_SP, Span, Symbol,
     sym::{self},
 };
 
 use self::errors::{CheckerError, ResultExt};
 use crate::{
+    checker::mir::RawPtrKind,
     ghost_statements::{CheckerId, GhostStatement, GhostStatements, Point},
     primops,
     queue::WorkQueue,
@@ -1511,9 +1513,12 @@ impl<'ck, 'genv, 'tcx, M: Mode> Checker<'ck, 'genv, 'tcx, M> {
             Rvalue::RawPtr(kind, place) => {
                 // ignore any refinements on the type stored at place
                 let ty = &env.lookup_rust_ty(genv, place).with_span(stmt_span)?;
-                let ty = self.refine_default(ty).with_span(stmt_span)?;
-                let ty = BaseTy::RawPtr(ty, kind.to_mutbl_lossy()).to_ty();
-                Ok(ty)
+                let ctor = self
+                    .default_refiner
+                    .refine_ty_or_base(&ty)
+                    .with_span(stmt_span)?
+                    .expect_base();
+                raw_ptr_with_size(genv, kind, ctor)
             }
             Rvalue::Cast(kind, op, to) => {
                 let from = self
@@ -2095,6 +2100,43 @@ impl<'ck, 'genv, 'tcx, M: Mode> Checker<'ck, 'genv, 'tcx, M> {
     fn refine_with_holes<T: Refine>(&self, ty: &T) -> QueryResult<<T as Refine>::Output> {
         ty.refine(&Refiner::with_holes(self.genv, self.checker_id.root_id().to_def_id())?)
     }
+}
+
+/// Converts a reference into a raw-ptr, tracking size etc.
+///
+///     &mut T => *mut{p: p.size == T::size_of() && p.base == p.addr && p.addr % T::align_of() == 0 } T
+///
+/// see test `fn ref_to_ptr_read` in `crates/flux/tests/tests/with_deps/pos/extern_specs/flux_core_ptr01.rs`
+fn raw_ptr_with_size(genv: GlobalEnv, kind: &RawPtrKind, ctor: SubsetTyCtor) -> Result<Ty> {
+    let sized_id = genv.tcx().require_lang_item(LangItem::Sized, DUMMY_SP);
+    let bty = BaseTy::RawPtr(ctor.to_ty(), kind.to_mutbl_lossy());
+    let args = rty::List::from_arr([GenericArg::Base(ctor)]);
+    let size_of_expr = Expr::alias(
+        AliasReft {
+            assoc_id: genv.require_builtin_assoc_reft(sized_id, sym::size_of),
+            args: args.clone(),
+        },
+        rty::List::empty(),
+    );
+    let align_of_expr = Expr::alias(
+        AliasReft { assoc_id: genv.require_builtin_assoc_reft(sized_id, sym::align_of), args },
+        rty::List::empty(),
+    );
+
+    let nu = Expr::nu();
+    let base = Expr::field_proj(&nu, rty::FieldProj::RawPtr { field: rty::RawPtrField::Base });
+    let addr = Expr::field_proj(&nu, rty::FieldProj::RawPtr { field: rty::RawPtrField::Addr });
+    let size = Expr::field_proj(nu, rty::FieldProj::RawPtr { field: rty::RawPtrField::Size });
+
+    let pred = Expr::and_from_iter([
+        Expr::eq(base, addr.clone()),
+        Expr::ne(addr.clone(), Expr::zero()),
+        Expr::eq(size, size_of_expr),
+        Expr::eq(Expr::binary_op(BinOp::Mod(Sort::Int), addr, align_of_expr), Expr::zero()),
+    ]);
+
+    let ty = Ty::exists_with_constr(bty, pred);
+    Ok(ty)
 }
 
 fn instantiate_args_for_fun_call(

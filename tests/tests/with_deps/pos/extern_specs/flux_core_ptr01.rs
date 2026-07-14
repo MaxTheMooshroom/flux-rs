@@ -32,6 +32,7 @@ pub fn test_add_mut_ix(ptr: *mut i32) {
     }
 }
 
+
 // --- offset (signed count — forward and backward) ---
 
 // forward: like add(1) but with isize
@@ -157,4 +158,9 @@ pub fn test_offset_from_unsigned_mut(buf: &mut [i32; 4]) {
         let diff = p2.offset_from_unsigned(p1);
         assert(diff == 2);
     }
+}
+
+
+pub fn ref_to_ptr_read(z: i32) -> i32 {
+    unsafe { std::ptr::read(&z) }
 }
