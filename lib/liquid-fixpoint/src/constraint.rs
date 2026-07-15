@@ -9,7 +9,7 @@ use crate::{ThyFunc, Types};
 pub struct Bind<T: Types> {
     pub name: T::Var,
     pub sort: Sort<T>,
-    pub pred: Pred<T>,
+    pub preds: Vec<Pred<T>>,
 }
 
 #[derive_where(Hash, Clone, Debug)]
@@ -41,8 +41,8 @@ impl<T: Types> Constraint<T> {
             match c {
                 Constraint::Conj(cs) => cs.iter().for_each(|c| go(c, count)),
                 Constraint::ForAll(_, c) => go(c, count),
-                Constraint::Pred(p, _) => {
-                    if p.is_concrete() && !p.is_trivially_true() {
+                Constraint::Pred(head, _) => {
+                    if head.is_concrete() && !head.is_trivially_true() {
                         *count += 1;
                     }
                 }
@@ -216,51 +216,22 @@ pub enum SortCtor<T: Types> {
 
 #[derive_where(Hash, Clone, Debug)]
 pub enum Pred<T: Types> {
-    And(Vec<Self>),
     KVar(T::KVar, Vec<Expr<T>>),
     Expr(Expr<T>),
 }
 
 impl<T: Types> Pred<T> {
-    pub const TRUE: Self = Pred::Expr(Expr::Constant(Constant::Boolean(true)));
-
-    pub fn and(mut preds: Vec<Self>) -> Self {
-        if preds.is_empty() {
-            Pred::TRUE
-        } else if preds.len() == 1 {
-            preds.remove(0)
-        } else {
-            Self::And(preds)
-        }
-    }
+    pub const TRUE: Self = Pred::Expr(Expr::TRUE);
 
     pub fn is_trivially_true(&self) -> bool {
         match self {
-            Pred::Expr(Expr::Constant(Constant::Boolean(true))) => true,
-            Pred::And(ps) => ps.is_empty(),
-            _ => false,
+            Pred::Expr(e) => e.is_trivially_true(),
+            Pred::KVar(..) => false,
         }
     }
 
     pub fn is_concrete(&self) -> bool {
-        match self {
-            Pred::And(ps) => ps.iter().any(Pred::is_concrete),
-            Pred::KVar(_, _) => false,
-            Pred::Expr(_) => true,
-        }
-    }
-
-    #[cfg(feature = "rust-fixpoint")]
-    pub(crate) fn simplify(&mut self) {
-        if let Pred::And(conjuncts) = self {
-            if conjuncts.is_empty() {
-                *self = Pred::TRUE;
-            } else if conjuncts.len() == 1 {
-                *self = conjuncts[0].clone();
-            } else {
-                conjuncts.iter_mut().for_each(|pred| pred.simplify());
-            }
-        }
+        matches!(self, Pred::Expr(_))
     }
 }
 
@@ -317,6 +288,8 @@ impl<T: Types> From<Constant<T>> for Expr<T> {
 }
 
 impl<T: Types> Expr<T> {
+    pub const TRUE: Self = Expr::Constant(Constant::Boolean(true));
+
     pub const fn int(val: u128) -> Expr<T> {
         Expr::Constant(Constant::Numeral(val))
     }
@@ -443,6 +416,10 @@ impl<T: Types> Expr<T> {
             }
         };
         vars
+    }
+
+    pub fn is_trivially_true(&self) -> bool {
+        matches!(self, Expr::Constant(Constant::Boolean(true)))
     }
 }
 

@@ -23,6 +23,7 @@ mod format;
 mod graph;
 pub mod parser;
 pub mod sexp;
+pub mod smt_horn;
 
 use std::{
     collections::{HashMap, hash_map::DefaultHasher},
@@ -121,7 +122,6 @@ macro_rules! declare_types {
         pub mod fixpoint_generated {
             pub struct FixpointTypes;
             pub type Expr = $crate::Expr<FixpointTypes>;
-            pub type Pred = $crate::Pred<FixpointTypes>;
             pub type Constraint = $crate::Constraint<FixpointTypes>;
             pub type KVarDecl = $crate::KVarDecl<FixpointTypes>;
             pub type ConstDecl = $crate::ConstDecl<FixpointTypes>;
@@ -138,6 +138,7 @@ macro_rules! declare_types {
             pub type DataField = $crate::DataField<FixpointTypes>;
             pub type Bind = $crate::Bind<FixpointTypes>;
             pub type Constant = $crate::Constant<FixpointTypes>;
+            pub type Pred = $crate::Pred<FixpointTypes>;
             pub use $crate::{BinOp, BinRel, BoundVar, Quantifier, ThyFunc};
         }
 
@@ -338,6 +339,7 @@ impl<T: Types> Task<T> {
             status: cstr_with_env.is_satisfiable(),
             solution: vec![],
             non_cuts_solution: vec![],
+            lean_status: LeanStatus::Invalid,
         })
     }
 

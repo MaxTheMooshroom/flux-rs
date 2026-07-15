@@ -810,22 +810,15 @@ where
         match cstr {
             fixpoint::Constraint::ForAll(bind, inner) => {
                 let inner = self.extract_assumed_consts_aux(*inner, acc);
-                if let fixpoint::Pred::Expr(fixpoint::Expr::Atom(fixpoint::BinRel::Eq, operands)) =
-                    bind.pred
+                if let [
+                    fixpoint::Pred::Expr(fixpoint::Expr::Atom(fixpoint::BinRel::Eq, operands)),
+                ] = &bind.preds[..]
                 {
-                    let [left, right] = *operands;
+                    let [left, right] = &**operands;
                     if let fixpoint::Expr::Var(fixpoint::Var::Const(gvar, Some(_))) = left {
-                        acc.insert(gvar, right);
+                        acc.insert(*gvar, right.clone());
                         inner
                     } else {
-                        let bind = fixpoint::Bind {
-                            name: bind.name,
-                            sort: bind.sort,
-                            pred: fixpoint::Pred::Expr(fixpoint::Expr::Atom(
-                                fixpoint::BinRel::Eq,
-                                Box::new([left, right]),
-                            )),
-                        };
                         fixpoint::Constraint::ForAll(bind, Box::new(inner))
                     }
                 } else {
@@ -833,7 +826,7 @@ where
                 }
             }
             fixpoint::Constraint::Conj(cstrs) => {
-                fixpoint::Constraint::Conj(
+                fixpoint::Constraint::conj(
                     cstrs
                         .into_iter()
                         .map(|cstr| self.extract_assumed_consts_aux(cstr, acc))
@@ -998,8 +991,12 @@ where
             }
             rty::ExprKind::KVar(kvar) => {
                 let mut bindings = vec![];
-                let pred = self.kvar_to_fixpoint(kvar, &mut bindings)?;
-                Ok(fixpoint::Constraint::foralls(bindings, fixpoint::Constraint::Pred(pred, None)))
+                let preds = self
+                    .kvar_to_fixpoint(kvar, &mut bindings)?
+                    .into_iter()
+                    .map(|p| fixpoint::Constraint::Pred(p, None))
+                    .collect();
+                Ok(fixpoint::Constraint::foralls(bindings, fixpoint::Constraint::conj(preds)))
             }
             rty::ExprKind::Quant(QuantKind::Forall, QuantDom::Unbounded, pred) => {
                 self.ecx
@@ -1013,7 +1010,7 @@ where
                         fixpoint::Bind {
                             name: var.into(),
                             sort: self.scx.sort_to_fixpoint(kind.expect_sort()),
-                            pred: fixpoint::Pred::TRUE,
+                            preds: vec![],
                         }
                     })
                     .collect_vec();
@@ -1035,11 +1032,11 @@ where
     pub(crate) fn assumption_to_fixpoint(
         &mut self,
         pred: &rty::Expr,
-    ) -> QueryResult<(Vec<fixpoint::Bind>, fixpoint::Pred)> {
+    ) -> QueryResult<(Vec<fixpoint::Bind>, Vec<fixpoint::Pred>)> {
         let mut bindings = vec![];
         let mut preds = vec![];
         self.assumption_to_fixpoint_aux(pred, &mut bindings, &mut preds)?;
-        Ok((bindings, fixpoint::Pred::and(preds)))
+        Ok((bindings, preds))
     }
 
     /// Auxiliary function to merge nested conjunctions in a single predicate
@@ -1055,7 +1052,7 @@ where
                 self.assumption_to_fixpoint_aux(e2, bindings, preds)?;
             }
             rty::ExprKind::KVar(kvar) => {
-                preds.push(self.kvar_to_fixpoint(kvar, bindings)?);
+                preds.extend(self.kvar_to_fixpoint(kvar, bindings)?);
             }
             _ => {
                 preds.push(fixpoint::Pred::Expr(self.ecx.expr_to_fixpoint(expr, &mut self.scx)?));
@@ -1068,7 +1065,7 @@ where
         &mut self,
         kvar: &rty::KVar,
         bindings: &mut Vec<fixpoint::Bind>,
-    ) -> QueryResult<fixpoint::Pred> {
+    ) -> QueryResult<Vec<fixpoint::Pred>> {
         let decl = self.kvars.get(kvar.kvid);
         let kvids = self.kcx.declare(kvar.kvid, decl, &self.ecx.backend);
 
@@ -1083,12 +1080,12 @@ where
             bindings.push(fixpoint::Bind {
                 name: fresh.into(),
                 sort: fixpoint::Sort::Int,
-                pred: fixpoint::Pred::Expr(fixpoint::Expr::eq(
+                preds: vec![fixpoint::Pred::Expr(fixpoint::Expr::eq(
                     fixpoint::Expr::Var(var),
                     fixpoint::Expr::int(0),
-                )),
+                ))],
             });
-            return Ok(fixpoint::Pred::KVar(kvids.start, vec![fixpoint::Expr::Var(var)]));
+            return Ok(vec![fixpoint::Pred::KVar(kvids.start, vec![fixpoint::Expr::Var(var)])]);
         }
 
         let kvars = kvids
@@ -1098,8 +1095,7 @@ where
                 fixpoint::Pred::KVar(kvid, args)
             })
             .collect_vec();
-
-        Ok(fixpoint::Pred::And(kvars))
+        Ok(kvars)
     }
 }
 
@@ -2265,11 +2261,15 @@ impl<'genv, 'tcx> ExprEncodingCtxt<'genv, 'tcx> {
                                     fixpoint::Bind {
                                         name: fixpoint::Var::Underscore,
                                         sort: fixpoint::Sort::Int,
-                                        pred,
+                                        preds: vec![pred],
                                     }
                                 }
                                 Backend::Lean => {
-                                    fixpoint::Bind { name: const_name, sort: const_sort, pred }
+                                    fixpoint::Bind {
+                                        name: const_name,
+                                        sort: const_sort,
+                                        preds: vec![pred],
+                                    }
                                 }
                             };
                             constraint = fixpoint::Constraint::ForAll(bind, Box::new(constraint));
@@ -2281,7 +2281,7 @@ impl<'genv, 'tcx> ExprEncodingCtxt<'genv, 'tcx> {
                         fixpoint::Bind {
                             name: const_.name,
                             sort: const_.sort.clone(),
-                            pred: fixpoint::Pred::TRUE,
+                            preds: vec![],
                         },
                         Box::new(constraint),
                     );
@@ -2402,12 +2402,12 @@ impl<'genv, 'tcx> ExprEncodingCtxt<'genv, 'tcx> {
     }
 }
 
-fn mk_implies(assumption: fixpoint::Pred, cstr: fixpoint::Constraint) -> fixpoint::Constraint {
+fn mk_implies(assumption: Vec<fixpoint::Pred>, cstr: fixpoint::Constraint) -> fixpoint::Constraint {
     fixpoint::Constraint::ForAll(
         fixpoint::Bind {
             name: fixpoint::Var::Underscore,
             sort: fixpoint::Sort::Int,
-            pred: assumption,
+            preds: assumption,
         },
         Box::new(cstr),
     )

@@ -7,8 +7,8 @@ use itertools::Itertools;
 
 use crate::{
     BinOp, BinRel, ConstDecl, Constant, Constraint, DataCtor, DataDecl, DataField, Expr,
-    FixpointFmt, FunDef, FunSort, Identifier, KVarDecl, Pred, Qualifier, Sort, SortCtor, Task,
-    Types, constraint::Quantifier,
+    FixpointFmt, FunDef, FunSort, Identifier, KVarDecl, Qualifier, Sort, SortCtor, Task, Types,
+    constraint::{Pred, Quantifier},
 };
 
 pub(crate) fn fmt_constraint<T: Types>(
@@ -129,7 +129,13 @@ impl ConstraintFormatter {
         cstr: &Constraint<T>,
     ) -> fmt::Result {
         match cstr {
-            Constraint::Pred(pred, tag) => self.fmt_pred_in_head_position(pred, tag.as_ref(), f),
+            Constraint::Pred(head, tag) => {
+                if let Some(tag) = tag {
+                    write!(f, "(tag {head} \"{tag}\")")
+                } else {
+                    write!(f, "{head}")
+                }
+            }
             Constraint::Conj(cstrs) => {
                 match &cstrs[..] {
                     [] => write!(f, "((true))"),
@@ -147,47 +153,39 @@ impl ConstraintFormatter {
                 }
             }
             Constraint::ForAll(bind, head) => {
-                write!(f, "(forall (({} {}) {})", bind.name.display(), bind.sort, bind.pred)?;
-
+                write!(f, "(forall (({} {}) ", bind.name.display(), bind.sort,)?;
+                self.fmt_preds_in_assumption_position(&bind.preds, f)?;
+                write!(f, ")")?;
                 self.incr();
                 self.newline(f)?;
                 self.fmt_constraint(f, head)?;
                 self.decr();
-
                 f.write_str(")")
             }
         }
     }
 
-    fn fmt_pred_in_head_position<T: Types>(
+    fn fmt_preds_in_assumption_position<T: Types>(
         &mut self,
-        pred: &Pred<T>,
-        tag: Option<&T::Tag>,
+        preds: &[Pred<T>],
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
-        match pred {
-            Pred::And(preds) => {
-                match &preds[..] {
-                    [] => write!(f, "((true))"),
-                    [pred] => self.fmt_pred_in_head_position(pred, tag, f),
-                    _ => {
-                        write!(f, "(and")?;
-                        for pred in preds {
-                            self.incr();
-                            self.newline(f)?;
-                            self.fmt_pred_in_head_position(pred, tag, f)?;
-                            self.decr();
-                        }
-                        write!(f, ")")
+        match preds {
+            [] => write!(f, "((true))"),
+            _ => {
+                if preds.len() > 1 {
+                    write!(f, "(and")?;
+                }
+                for (i, pred) in preds.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " ")?;
                     }
+                    write!(f, "{pred}")?;
                 }
-            }
-            Pred::Expr(_) | Pred::KVar(..) => {
-                if let Some(tag) = tag {
-                    write!(f, "(tag {pred} \"{tag}\")")
-                } else {
-                    write!(f, "{pred}")
+                if preds.len() > 1 {
+                    write!(f, ")")?;
                 }
+                Ok(())
             }
         }
     }
@@ -293,13 +291,6 @@ fn fmt_func<T: Types>(params: usize, sort: &Sort<T>, f: &mut fmt::Formatter<'_>)
 impl<T: Types> fmt::Display for Pred<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Pred::And(preds) => {
-                match &preds[..] {
-                    [] => write!(f, "((true))"),
-                    [pred] => write!(f, "{pred}"),
-                    preds => write!(f, "(and {})", preds.iter().join(" ")),
-                }
-            }
             Pred::KVar(kvid, args) => {
                 write!(f, "(${} {})", kvid.display(), args.iter().join(" "),)
             }
