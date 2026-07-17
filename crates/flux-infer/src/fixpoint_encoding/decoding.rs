@@ -5,7 +5,7 @@ use flux_middle::{
 };
 use flux_rustc_bridge::lowering::Lower;
 use itertools::Itertools;
-use rustc_hir::def_id::DefId;
+use rustc_hir::{def::DefKind, def_id::DefId};
 use rustc_type_ir::BoundVar;
 
 use super::{ConstKey, FixpointCtxt, fixpoint};
@@ -161,6 +161,9 @@ where
                                         "Should be specially handled as the head of a function app."
                                     )
                                 }
+                                ConstKey::WKVar(_, _) => {
+                                    unreachable!("Weak kvars are not global vars");
+                                }
                             }
                         } else {
                             Err(FixpointParseError::NoGlobalVar(*global_var))
@@ -184,7 +187,16 @@ where
                             }
                         }
 
-                        Err(FixpointParseError::NoLocalVar(*fname))
+                        // This is a free var generated from an existential we
+                        // got from fixpoint. It should be unique (previously we
+                        // had a terrible hack to add 100_000 to ensure it was
+                        // --- this should be no longer necessary; however if
+                        // there are issues with name clashes because the
+                        // uniqueness property is violated, we should probably
+                        // just add make the local var an enum and make this a
+                        // separate enumeration).
+                        Ok(rty::Expr::fvar(rty::Name::from_u32(fname.as_u32())))
+                        // Err(FixpointParseError::NoLocalVar(*fname))
                     }
                     fixpoint::Var::DataCtor(adt_id, variant_idx) => {
                         let def_id = self.scx.adt_sorts[adt_id.as_usize()];
@@ -203,6 +215,11 @@ where
                     }
                     fixpoint::Var::ConstGeneric(const_generic) => {
                         Ok(rty::Expr::const_generic(*const_generic))
+                    }
+                    fixpoint::Var::WKVar(..) => {
+                        unreachable!(
+                            "Weak kvar ids should be converted as part of fixpoint::Expr::WKVar"
+                        );
                     }
                 }
             }
@@ -252,6 +269,21 @@ where
                             Ok(rty::Expr::tuple(eargs))
                         } else {
                             Err(FixpointParseError::TupleCtorArityMismatch(*arity, fargs.len()))
+                        }
+                    }
+                    fixpoint::Expr::Var(fixpoint::Var::DataCtor(adt_id, field)) => {
+                        let eargs = fargs
+                            .iter()
+                            .map(|farg| self.fixpoint_to_expr(farg))
+                            .try_collect()?;
+                        let def_id = self.scx.adt_sorts[adt_id.as_usize()];
+                        match self.genv.tcx().def_kind(def_id) {
+                            DefKind::Struct => Ok(rty::Expr::ctor_struct(def_id, eargs)),
+                            DefKind::Enum => {
+                                let ctor = rty::Ctor::Enum(def_id, *field);
+                                Ok(rty::Expr::ctor(ctor, eargs))
+                            }
+                            _ => Err(FixpointParseError::InvalidDefKindForCtor),
                         }
                     }
                     fixpoint::Expr::Var(fixpoint::Var::UIFRel(fbinrel)) => {
@@ -317,6 +349,9 @@ where
                                         .map(|farg| self.fixpoint_to_expr(farg))
                                         .try_collect()?;
                                     Ok(rty::Expr::alias(alias_reft, args))
+                                }
+                                ConstKey::WKVar(..) => {
+                                    unreachable!("WKVars should not appear in global vars");
                                 }
                                 ConstKey::RustConst(..) | ConstKey::Lambda(..) => {
                                     // These should be treated as a normal app.
@@ -437,6 +472,28 @@ where
                     fixpoint::Quantifier::Forall => Ok(rty::Expr::forall(expr)),
                 }
             }
+            fixpoint::Expr::WKVar(fixpoint::WKVar { wkvid, args }) => {
+                let e_args: Vec<rty::Expr> = args
+                    .iter()
+                    .map(|fexpr| self.fixpoint_to_expr(fexpr))
+                    .try_collect()?;
+                if let Some(const_key) = self.ecx.const_env.wkvar_map_rev.get(wkvid) {
+                    match const_key {
+                        ConstKey::WKVar(wkvid, self_args) => {
+                            Ok(rty::Expr::wkvar(rty::WKVar {
+                                wkvid: wkvid.clone(),
+                                self_args: *self_args,
+                                args: List::from_vec(e_args),
+                            }))
+                        }
+                        _ => {
+                            unreachable!("Weak KVar has a const_key that is not a wkvid");
+                        }
+                    }
+                } else {
+                    unreachable!("missing weak kvar {:?} in const_env", wkvid);
+                }
+            }
         }
     }
 
@@ -487,10 +544,11 @@ pub enum FixpointParseError {
     /// Casts should only have 1 arg
     CastArityMismatch(usize),
     PrimOpArityMismatch(usize),
-    NoLocalVar(fixpoint::LocalVar),
+    // NoLocalVar(fixpoint::LocalVar),
     /// Expecting fixpoint::Var::DataCtor
     WrongVarInIsCtor(fixpoint::Var),
     /// Expecting fixpoint::Var::LocalVar
     WrongVarInBinder(fixpoint::Var),
     UnknownAdt(DefId),
+    InvalidDefKindForCtor,
 }
