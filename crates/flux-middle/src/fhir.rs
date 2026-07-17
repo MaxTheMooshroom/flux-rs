@@ -19,9 +19,11 @@ use std::{borrow::Cow, fmt, iter};
 
 use flux_common::{bug, span_bug};
 use flux_config::PartialInferOpts;
-use flux_rustc_bridge::def_id_to_string;
 pub use flux_syntax::surface::{BinOp, UnOp};
-use flux_syntax::surface::{Ignored, ParamMode, Trusted};
+use flux_syntax::{
+    surface::{Ignored, ParamMode, Trusted},
+    symbols::sym,
+};
 use itertools::Itertools;
 use rustc_abi;
 pub use rustc_abi::VariantIdx;
@@ -33,7 +35,7 @@ use rustc_data_structures::{
 pub use rustc_hir::PrimTy;
 use rustc_hir::{
     FnHeader, OwnerId, ParamName, Safety,
-    def::{DefKind, Namespace},
+    def::DefKind,
     def_id::{DefId, LocalDefId},
 };
 use rustc_index::newtype_index;
@@ -739,12 +741,95 @@ pub enum ConstArgKind {
     Infer,
 }
 
+/// Different kinds of symbols can coexist even if they share the same textual name.
+/// Therefore, they each have a separate universe (known as a "namespace").
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
+pub enum Namespace {
+    /// We also put sorts in this namespace.
+    ///
+    /// See [`rustc_hir::def::Namespace::TypeNS`]
+    TypeNS,
+    /// See [`rustc_hir::def::Namespace::ValueNS`]
+    ValueNS,
+    /// See [`rustc_hir::def::Namespace::MacroNS`]
+    MacroNS,
+    /// The refinement namespace includes refinement functions, theory function,
+    /// refinement parameters, ...
+    ReftNS,
+}
+
+impl Namespace {
+    /// A human-readable description, used in diagnostics.
+    pub fn descr(self) -> &'static str {
+        match self {
+            Namespace::TypeNS => "type",
+            Namespace::ValueNS => "value",
+            Namespace::MacroNS => "macro",
+            Namespace::ReftNS => "value",
+        }
+    }
+
+    /// The corresponding [`rustc_hir::def::Namespace`], or `None` for the flux-only namespaces.
+    pub fn to_rustc(self) -> Option<rustc_hir::def::Namespace> {
+        match self {
+            Namespace::TypeNS => Some(rustc_hir::def::Namespace::TypeNS),
+            Namespace::ValueNS => Some(rustc_hir::def::Namespace::ValueNS),
+            Namespace::MacroNS => Some(rustc_hir::def::Namespace::MacroNS),
+            Namespace::ReftNS => None,
+        }
+    }
+}
+
+impl From<rustc_hir::def::Namespace> for Namespace {
+    fn from(ns: rustc_hir::def::Namespace) -> Self {
+        match ns {
+            rustc_hir::def::Namespace::TypeNS => Namespace::TypeNS,
+            rustc_hir::def::Namespace::ValueNS => Namespace::ValueNS,
+            rustc_hir::def::Namespace::MacroNS => Namespace::MacroNS,
+        }
+    }
+}
+
+/// Flux's analogue of [`rustc_hir::def::PerNS`], carrying one `T` per [`Namespace`] (including the
+/// flux-specific ones), indexable by [`Namespace`].
+#[derive(Debug, Clone)]
+pub struct PerNS<T> {
+    pub type_ns: T,
+    pub value_ns: T,
+    pub macro_ns: T,
+    pub flux_fn_ns: T,
+}
+
+impl<T> std::ops::Index<Namespace> for PerNS<T> {
+    type Output = T;
+
+    fn index(&self, ns: Namespace) -> &T {
+        match ns {
+            Namespace::TypeNS => &self.type_ns,
+            Namespace::ValueNS => &self.value_ns,
+            Namespace::MacroNS => &self.macro_ns,
+            Namespace::ReftNS => &self.flux_fn_ns,
+        }
+    }
+}
+
+impl<T> std::ops::IndexMut<Namespace> for PerNS<T> {
+    fn index_mut(&mut self, ns: Namespace) -> &mut T {
+        match ns {
+            Namespace::TypeNS => &mut self.type_ns,
+            Namespace::ValueNS => &mut self.value_ns,
+            Namespace::MacroNS => &mut self.macro_ns,
+            Namespace::ReftNS => &mut self.flux_fn_ns,
+        }
+    }
+}
+
 /// The resolution of a path
 ///
 /// The enum contains a subset of the variants in [`rustc_hir::def::Res`] plus some extra variants
 /// for stuff refinements resolve to.
 #[derive(Eq, PartialEq, Debug, Copy, Clone)]
-pub enum Res<Id = !> {
+pub enum Res<Id = ParamId> {
     /// See [`rustc_hir::def::Res::Def`]
     Def(DefKind, DefId),
     /// See [`rustc_hir::def::Res::PrimTy`]
@@ -762,12 +847,18 @@ pub enum Res<Id = !> {
     Param(ParamKind, Id),
     /// A refinement function defined with `flux::defs! { ... }`
     GlobalFunc(SpecFuncKind),
+    /// A primitive sort, e.g., `int`, `bool`, `Set`, `Map`.
+    PrimSort(PrimSort),
+    /// A sort parameter inside a polymorphic function or data sort.
+    SortParam(usize),
+    /// A user declared sort.
+    UserSort(FluxDefId),
     Err,
 }
 
 /// See [`rustc_hir::def::PartialRes`]
 #[derive(Copy, Clone, Debug)]
-pub struct PartialRes<Id = !> {
+pub struct PartialRes<Id = ParamId> {
     base_res: Res<Id>,
     unresolved_segments: usize,
 }
@@ -884,78 +975,71 @@ impl InferMode {
     }
 }
 
-#[derive(Clone, Copy)]
+/// `bool`, `char`, and `str` are primitive sorts, but because sorts and types are in the same
+/// namespace we resolve them to [`Res::PrimTy`] and then make them into a sort during `conv`
+/// they share their name with the
+#[derive(Debug, Eq, PartialEq, Clone, Copy)]
 pub enum PrimSort {
     Int,
-    Bool,
-    Char,
     Real,
     Set,
     Map,
-    Str,
     RawPtr,
+    Bool,
+    Char,
+    Str,
 }
 
 impl PrimSort {
+    pub const ALL: [Self; 8] = [
+        Self::Int,
+        Self::Real,
+        Self::Set,
+        Self::Map,
+        Self::RawPtr,
+        Self::Bool,
+        Self::Char,
+        Self::Str,
+    ];
+
+    pub fn name(self) -> Symbol {
+        match self {
+            PrimSort::Int => sym::int,
+            PrimSort::Real => sym::real,
+            PrimSort::Set => sym::Set,
+            PrimSort::Map => sym::Map,
+            PrimSort::RawPtr => sym::ptr,
+            PrimSort::Bool => sym::bool,
+            PrimSort::Char => sym::char,
+            PrimSort::Str => sym::str,
+        }
+    }
     pub fn name_str(self) -> &'static str {
         match self {
             PrimSort::Int => "int",
-            PrimSort::Str => "str",
-            PrimSort::Bool => "bool",
-            PrimSort::Char => "char",
             PrimSort::Real => "real",
             PrimSort::Set => "Set",
             PrimSort::Map => "Map",
             PrimSort::RawPtr => "ptr",
+            PrimSort::Bool => "bool",
+            PrimSort::Char => "char",
+            PrimSort::Str => "str",
         }
     }
 
     /// Number of generics expected by this primitive sort
     pub fn generics(self) -> usize {
         match self {
-            PrimSort::Int
-            | PrimSort::Bool
-            | PrimSort::Real
+            PrimSort::Bool
             | PrimSort::Char
             | PrimSort::Str
+            | PrimSort::Int
+            | PrimSort::Real
             | PrimSort::RawPtr => 0,
             PrimSort::Set => 1,
             PrimSort::Map => 2,
         }
     }
-}
-
-#[derive(Clone, Copy)]
-pub enum SortRes {
-    /// A primitive sort.
-    PrimSort(PrimSort),
-    /// A user declared sort.
-    User(FluxDefId),
-    /// A sort parameter inside a polymorphic function or data sort.
-    SortParam(usize),
-    /// The sort associated to a (generic) type parameter
-    TyParam(DefId),
-    /// The sort of the `Self` type, as used within a trait.
-    SelfParam {
-        /// The trait this `Self` is a generic parameter for.
-        trait_id: DefId,
-    },
-    /// The sort of a `Self` type, as used somewhere other than within a trait.
-    SelfAlias {
-        /// The item introducing the `Self` type alias, e.g., an impl block.
-        alias_to: DefId,
-    },
-    /// The sort of an associated type in a trait declaration, e.g:
-    ///
-    /// ```ignore
-    /// #[assoc(fn assoc_reft(x: Self::Assoc) -> bool)]
-    /// trait MyTrait {
-    ///     type Assoc;
-    /// }
-    /// ```
-    SelfParamAssoc { trait_id: DefId, ident: Ident },
-    /// The sort automatically generated for an adt (enum/struct) with a `flux::refined_by` annotation
-    Adt(DefId),
 }
 
 #[derive(Clone, Copy)]
@@ -980,7 +1064,7 @@ pub enum Sort<'fhir> {
 /// See [`flux_syntax::surface::SortPath`]
 #[derive(Clone, Copy)]
 pub struct SortPath<'fhir> {
-    pub res: SortRes,
+    pub res: PartialRes,
     pub segments: &'fhir [Ident],
     pub args: &'fhir [Sort<'fhir>],
 }
@@ -1095,7 +1179,7 @@ pub enum Lit {
 #[derive(Clone, Copy)]
 pub struct PathExpr<'fhir> {
     pub segments: &'fhir [Ident],
-    pub res: Res<ParamId>,
+    pub res: Res,
     pub fhir_id: FhirId,
     pub span: Span,
 }
@@ -1145,6 +1229,9 @@ impl<Id> Res<Id> {
             Res::SelfTyAlias { .. } | Res::SelfTyParam { .. } => "self type",
             Res::Param(..) => "refinement parameter",
             Res::GlobalFunc(..) => "refinement function",
+            Res::PrimSort(..) => "primitive sort",
+            Res::SortParam(..) => "sort parameter",
+            Res::UserSort(..) => "user-defined sort",
             Res::Err => "unresolved item",
         }
     }
@@ -1160,11 +1247,14 @@ impl<Id> Res<Id> {
     /// Returns `None` if this is `Res::Err`
     pub fn ns(&self) -> Option<Namespace> {
         match self {
-            Res::Def(kind, ..) => kind.ns(),
+            Res::Def(kind, ..) => kind.ns().map(Namespace::from),
             Res::PrimTy(..) | Res::SelfTyAlias { .. } | Res::SelfTyParam { .. } => {
                 Some(Namespace::TypeNS)
             }
-            Res::Param(..) | Res::GlobalFunc(..) => Some(Namespace::ValueNS),
+            Res::Param(..) | Res::GlobalFunc(..) => Some(Namespace::ReftNS),
+            // Sorts share the type namespace: primitive sorts live in the type prelude and
+            // sort parameters in the type ribs, so they resolve through `TypeNS` alongside types.
+            Res::PrimSort(..) | Res::SortParam(..) | Res::UserSort(..) => Some(Namespace::TypeNS),
             Res::Err => None,
         }
     }
@@ -1184,6 +1274,9 @@ impl<Id> Res<Id> {
             }
             Res::SelfTyParam { trait_ } => Res::SelfTyParam { trait_ },
             Res::GlobalFunc(spec_func_kind) => Res::GlobalFunc(spec_func_kind),
+            Res::PrimSort(prim_sort) => Res::PrimSort(prim_sort),
+            Res::SortParam(n) => Res::SortParam(n),
+            Res::UserSort(def_id) => Res::UserSort(def_id),
             Res::Err => Res::Err,
         }
     }
@@ -1684,34 +1777,6 @@ impl fmt::Debug for SortPath<'_> {
             write!(f, "<{:?}>", self.args.iter().format(", "))?;
         }
         Ok(())
-    }
-}
-
-impl fmt::Debug for SortRes {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SortRes::PrimSort(PrimSort::Bool) => write!(f, "bool"),
-            SortRes::PrimSort(PrimSort::Int) => write!(f, "int"),
-            SortRes::PrimSort(PrimSort::Real) => write!(f, "real"),
-            SortRes::PrimSort(PrimSort::Char) => write!(f, "char"),
-            SortRes::PrimSort(PrimSort::Str) => write!(f, "str"),
-            SortRes::PrimSort(PrimSort::Set) => write!(f, "Set"),
-            SortRes::PrimSort(PrimSort::Map) => write!(f, "Map"),
-            SortRes::PrimSort(PrimSort::RawPtr) => write!(f, "ptr"),
-            SortRes::SortParam(n) => write!(f, "@{n}"),
-            SortRes::TyParam(def_id) => write!(f, "{}::sort", def_id_to_string(*def_id)),
-            SortRes::SelfParam { trait_id } => {
-                write!(f, "{}::Self::sort", def_id_to_string(*trait_id))
-            }
-            SortRes::SelfAlias { alias_to } => {
-                write!(f, "{}::Self::sort", def_id_to_string(*alias_to))
-            }
-            SortRes::SelfParamAssoc { ident: assoc, .. } => {
-                write!(f, "Self::{assoc}")
-            }
-            SortRes::User(def_id) => write!(f, "{:?}", def_id.name()),
-            SortRes::Adt(def_id) => write!(f, "{}::sort", def_id_to_string(*def_id)),
-        }
     }
 }
 
