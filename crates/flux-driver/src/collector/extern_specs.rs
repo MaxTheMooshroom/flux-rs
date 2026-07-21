@@ -68,7 +68,11 @@ impl<'a, 'sess, 'tcx> ExternSpecCollector<'a, 'sess, 'tcx> {
 
     fn collect_extern_fn(&mut self, item: &hir::Item, mut attrs: FluxAttrs) -> Result {
         if attrs.has_attrs() {
-            let sig = attrs.fn_sig();
+            let (sig, attr_span) = if let Some((sig, span)) = attrs.fn_sig_with_attr_span() {
+                (Some(sig), Some(span))
+            } else {
+                (None, None)
+            };
             self.inner.check_fn_sig_name(item.owner_id, sig.as_ref())?;
             let node_id = self.inner.next_node_id();
             self.inner.insert_item(
@@ -79,6 +83,11 @@ impl<'a, 'sess, 'tcx> ExternSpecCollector<'a, 'sess, 'tcx> {
                     node_id,
                 },
             )?;
+            if let Some(span) = attr_span {
+                self.inner
+                    .specs
+                    .set_spec_attr_span(item.owner_id.def_id.to_def_id(), span);
+            }
         }
 
         let extern_id = self.extract_extern_id_from_fn(item)?;
@@ -217,13 +226,22 @@ impl<'a, 'sess, 'tcx> ExternSpecCollector<'a, 'sess, 'tcx> {
         mut attrs: FluxAttrs,
     ) -> Result<ExternImplItem> {
         if attrs.has_attrs() {
-            let sig = attrs.fn_sig();
+            let (sig, attr_span) = if let Some((sig, span)) = attrs.fn_sig_with_attr_span() {
+                (Some(sig), Some(span))
+            } else {
+                (None, None)
+            };
             self.inner.check_fn_sig_name(item.owner_id, sig.as_ref())?;
             let node_id = self.inner.next_node_id();
             self.inner.insert_impl_item(
                 item.owner_id,
                 surface::ImplItemFn { attrs: attrs.into_attr_vec(), sig, node_id },
             )?;
+            if let Some(span) = attr_span {
+                self.inner
+                    .specs
+                    .set_spec_attr_span(item.owner_id.def_id.to_def_id(), span);
+            }
         }
 
         let extern_impl_item = self.extract_extern_id_from_impl_fn(impl_of_trait, item)?;
@@ -269,13 +287,22 @@ impl<'a, 'sess, 'tcx> ExternSpecCollector<'a, 'sess, 'tcx> {
     ) -> Result {
         let item_id = item.owner_id;
         if attrs.has_attrs() {
-            let sig = attrs.fn_sig();
+            let (sig, attr_span) = if let Some((sig, span)) = attrs.fn_sig_with_attr_span() {
+                (Some(sig), Some(span))
+            } else {
+                (None, None)
+            };
             self.inner.check_fn_sig_name(item.owner_id, sig.as_ref())?;
             let node_id = self.inner.next_node_id();
             self.inner.insert_trait_item(
                 item.owner_id,
                 surface::TraitItemFn { attrs: attrs.into_attr_vec(), sig, node_id },
             )?;
+            if let Some(span) = attr_span {
+                self.inner
+                    .specs
+                    .set_spec_attr_span(item.owner_id.def_id.to_def_id(), span);
+            }
         }
 
         let extern_fn_id = self.extract_extern_id_from_trait_fn(extern_trait_id, item)?;
