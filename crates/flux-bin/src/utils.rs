@@ -6,7 +6,6 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
-use serde::Deserialize;
 
 #[cfg(target_os = "windows")]
 pub const LIB_PATH: &str = "PATH";
@@ -20,16 +19,30 @@ pub use flux_sysroot::{FLUX_SYSROOT, flux_sysroot_dir};
 pub const EXIT_ERR: i32 = -1;
 
 const FLUX_DRIVER: &str = "FLUX_DRIVER";
+const CARGO: &str = "CARGO";
 
-#[derive(Deserialize)]
-pub struct ToolchainToml {
-    toolchain: ToolchainSpec,
-}
-
-#[derive(Deserialize)]
-pub struct ToolchainSpec {
-    channel: String,
-}
+// <<<<<<< HEAD
+// /// The path of the flux sysroot lib containing precompiled libraries and the flux driver.
+// pub fn flux_sysroot_dir() -> PathBuf {
+//     env::var_os(FLUX_SYSROOT).map_or_else(default_flux_sysroot_dir, PathBuf::from)
+// }
+//
+// /// Return the default sysroot
+// fn default_flux_sysroot_dir() -> PathBuf {
+//     home::home_dir()
+//         .expect("Couldn't find home directory")
+//         .join(".flux")
+// =======
+// #[derive(Deserialize)]
+// pub struct ToolchainToml {
+//     toolchain: ToolchainSpec,
+// }
+//
+// #[derive(Deserialize)]
+// pub struct ToolchainSpec {
+//     channel: String,
+// >>>>>>> upstream/main
+// }
 
 pub fn get_flux_driver_path(sysroot: &Path) -> Result<PathBuf> {
     let path = if let Some(path) = env::var_os(FLUX_DRIVER) {
@@ -47,13 +60,14 @@ pub fn get_flux_driver_path(sysroot: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-pub fn get_rust_toolchain() -> Result<String> {
-    let toolchain_str = include_str!("../../../rust-toolchain.toml");
-    let toolchain_file: ToolchainToml = toml::from_str(toolchain_str)?;
-    Ok(toolchain_file.toolchain.channel)
+pub const fn get_rust_toolchain() -> &'static str {
+    env!(
+        "RUST_TOOLCHAIN",
+        "build.rs failed to produce the RUST_TOOLCHAIN environment variable"
+    )
 }
 
-pub fn get_binary_path(toolchain: &str, bin: &str) -> anyhow::Result<PathBuf> {
+pub fn get_binary_path(toolchain: &str, bin: &str) -> Result<PathBuf> {
     let output = Command::new("rustup")
         .args(["which", "--toolchain", toolchain, bin])
         .output()
@@ -69,6 +83,43 @@ pub fn get_binary_path(toolchain: &str, bin: &str) -> anyhow::Result<PathBuf> {
             .trim()
             .to_string(),
     ))
+}
+
+pub fn get_cargo_path(toolchain: &str) -> Result<PathBuf> {
+    const RUST_TOOLCHAIN_CARGO_VERSION: &str = env!(
+        "RUST_TOOLCHAIN_CARGO_VERSION",
+        "build.rs failed to produce the RUST_TOOLCHAIN_CARGO_VERSION environment variable"
+    );
+
+    get_binary_path(toolchain, "cargo").or_else(|e| {
+        if let Some(path) = env::var_os(CARGO) {
+            let cargo = PathBuf::from(path);
+
+            match Command::new(&cargo).arg("version").output() {
+                Err(e) => Err(anyhow!("failed to run `{:?} version`: {e}", cargo)),
+                Ok(cargo_version_raw) => {
+                    let cargo_version = String::from_utf8(cargo_version_raw.stdout)
+                        .expect("Failed to create string from `cargo version` output");
+
+                    let cargo_version_str = cargo_version[..cargo_version.len()-1]
+                        .split_once(" ").unwrap().1
+                        .split_once(" ").unwrap().1;
+
+                    if cargo_version_str == RUST_TOOLCHAIN_CARGO_VERSION {
+                        Ok(cargo)
+                    } else {
+                        Err(anyhow!(
+                            "Version mismatch: '{}' != '{}'",
+                            cargo_version_str,
+                            RUST_TOOLCHAIN_CARGO_VERSION
+                        ))
+                    }
+                }
+            }
+        } else {
+            Err(e)
+        }
+    })
 }
 
 pub fn get_rust_sysroot(toolchain: &str) -> Result<PathBuf> {

@@ -11,7 +11,7 @@ use flux_bin::{
     FluxMetadata,
     cargo_flux_opts::{CargoFluxCommand, Cli},
     utils::{
-        EXIT_ERR, flux_sysroot_dir, get_binary_path, get_flux_driver_path, get_rust_toolchain,
+        EXIT_ERR, flux_sysroot_dir, get_cargo_path, get_flux_driver_path, get_rust_toolchain,
         print_version_and_exit,
     },
 };
@@ -38,15 +38,15 @@ fn main() {
 }
 
 fn run(cargo_flux_cmd: CargoFluxCommand) -> anyhow::Result<i32> {
-    let toolchain = get_rust_toolchain()?;
-    let cargo_path = get_binary_path(&toolchain, "cargo")?;
+    let toolchain = get_rust_toolchain();
+    let cargo_path = get_cargo_path(&toolchain)?;
 
     let metadata = cargo_flux_cmd.metadata().cargo_path(&cargo_path).exec()?;
     let sysroot = flux_sysroot_dir();
     let flux_driver_path = get_flux_driver_path(&sysroot)?;
     let config_file = write_cargo_config(metadata, &sysroot, &cargo_flux_cmd)?;
 
-    let mut cargo_command = Command::new("cargo");
+    let mut cargo_command = Command::new(cargo_path);
 
     // We set `RUSTC` as an environment variable and not in in the [build]
     // section of the config file to make sure we run flux even when the
@@ -54,8 +54,7 @@ fn run(cargo_flux_cmd: CargoFluxCommand) -> anyhow::Result<i32> {
     // conflicts, e.g., see https://github.com/flux-rs/flux/issues/1155
     cargo_command
         .env("RUSTC", flux_driver_path)
-        .env("RUSTC_WRAPPER", "")
-        .arg(format!("+{toolchain}"));
+        .env("RUSTC_WRAPPER", "");
 
     cargo_flux_cmd.forward_args(&mut cargo_command, config_file.path());
 

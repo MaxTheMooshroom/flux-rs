@@ -16,7 +16,7 @@ fn main() -> Result<()> {
 
     let flux_sysroot = flux_sysroot_dir();
     let flux_driver_path = get_flux_driver_path(&flux_sysroot)?;
-    let rust_sysroot = get_rust_sysroot(&get_rust_toolchain()?)?;
+    let rust_sysroot = get_rust_sysroot(get_rust_toolchain())?;
     let ld_library_path = get_rust_lib_path(&rust_sysroot);
     let extended_lib_path = prepend_path_to_env_var(LIB_PATH, ld_library_path)?;
 
