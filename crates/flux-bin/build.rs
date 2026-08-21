@@ -24,17 +24,10 @@ fn get_rust_toolchain_commit_info(toolchain: &str) -> String {
     use rustup_toolchain_manifest::{InstallSpec, Manifest, Toolchain};
 
     const VERSION_OVERRIDE: &str = "FLUX_TOOLCHAIN_CARGO_VERSION_OVERRIDE";
-    const CARGO_NET_OFFLINE: &str = "CARGO_NET_OFFLINE";
+    const SANDBOXED: &str = "SANDBOXED";
 
-    match (env::var_os(CARGO_NET_OFFLINE), env::var_os(VERSION_OVERRIDE)) {
+    match (env::var_os(SANDBOXED), env::var_os(VERSION_OVERRIDE)) {
         (Some(_), Some(version)) => version.into_string().unwrap(),
-        (Some(_), None) => {
-            let manifest_url = Toolchain::from_str(toolchain)
-                .unwrap_or_else(|_| panic!("Invalid toolchain string: {}", toolchain))
-                .manifest_url();
-
-            panic!("CARGO_NET_OFFLINE was set but no override was provided!\nManifest URL:\n{manifest_url}");
-        },
         _ => {
             let manifest_url = Toolchain::from_str(toolchain)
                 .unwrap_or_else(|_| panic!("Invalid toolchain string: {}", toolchain))
@@ -115,7 +108,7 @@ fn main() {
     println!("cargo:rustc-env=GIT_SHA_FULL={}", git_sha_full());
     println!("cargo:rustc-env=GIT_DATE={}", git_date());
 
-    println!("cargo:rerun-if-env-changed=CARGO_NET_OFFLINE");
+    println!("cargo:rerun-if-env-changed=SANDBOXED");
     println!("cargo:rerun-if-env-changed=FLUX_TOOLCHAIN_CARGO_VERSION_OVERRIDE");
 
     let tc = get_rust_toolchain();
