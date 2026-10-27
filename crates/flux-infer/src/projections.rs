@@ -6,9 +6,9 @@ use flux_middle::{
     queries::{QueryErr, QueryResult},
     query_bug,
     rty::{
-        self, AliasKind, AliasReft, AliasTy, BaseTy, Binder, Clause, ClauseKind, Const, ConstKind,
-        EarlyBinder, Expr, ExprKind, GenericArg, List, ProjectionPredicate, RefineArgs, Region,
-        Sort, SubsetTy, SubsetTyCtor, Ty, TyKind, TyOrBase,
+        self, AliasKind, AliasReft, AliasTerm, AliasTy, BaseTy, Binder, Clause, ClauseKind, Const,
+        ConstKind, EarlyBinder, Expr, ExprKind, GenericArg, List, ProjectionPredicate, RefineArgs,
+        Region, Sort, SubsetTy, SubsetTyCtor, Ty, TyKind, TyOrBase,
         fold::{FallibleTypeFolder, TypeFoldable, TypeSuperFoldable, TypeVisitable},
         refining::Refiner,
         subst::{GenericsSubstDelegate, GenericsSubstFolder},
@@ -29,7 +29,6 @@ use rustc_trait_selection::{
 use rustc_type_ir::TypeVisitableExt;
 
 use crate::{
-    fixpoint_encoding::KVarEncoding,
     infer::{InferCtxtAt, InferResult},
     refine_tree::Scope,
 };
@@ -85,7 +84,7 @@ impl<'a, 'infcx, 'genv, 'tcx> Normalizer<'a, 'infcx, 'genv, 'tcx> {
 
     fn normalize_projection_ty(
         &mut self,
-        obligation: &AliasTy,
+        obligation: &AliasTerm,
     ) -> QueryResult<(bool, SubsetTyCtor)> {
         // First we must recursively (i.e., deeply) normalize projection types before proceeding.
         // For example, in `issue-1449.rs` when normalizing `<<MyChoice as Choice>::Session as FromState>::Role`
@@ -126,10 +125,10 @@ impl<'a, 'infcx, 'genv, 'tcx> Normalizer<'a, 'infcx, 'genv, 'tcx> {
         let mut unresolved = vec![];
         for pred in preds {
             let term = pred.clone().skip_binder().term;
-            let alias_ty = pred.clone().map(|p| p.projection_ty);
-            match subst.instantiate_partial(alias_ty) {
-                Some(projection_ty) => {
-                    let pred = ProjectionPredicate { projection_ty, term };
+            let alias_term = pred.clone().map(|p| p.projection_term);
+            match subst.instantiate_partial(alias_term) {
+                Some(projection_term) => {
+                    let pred = ProjectionPredicate { projection_term, term };
                     resolved.push(pred);
                 }
                 None => unresolved.push(pred.clone()),
@@ -166,8 +165,7 @@ impl<'a, 'infcx, 'genv, 'tcx> Normalizer<'a, 'infcx, 'genv, 'tcx> {
                 break; // failed: there is some unresolved projection pred!
             }
             for p in resolved {
-                let obligation = &p.projection_ty;
-                let (_, ctor) = self.normalize_projection_ty(obligation)?;
+                let (_, ctor) = self.normalize_projection_ty(&p.projection_term)?;
                 subst.subset_tys(&p.term, &ctor);
             }
             projection_preds = unresolved;
@@ -178,7 +176,7 @@ impl<'a, 'infcx, 'genv, 'tcx> Normalizer<'a, 'infcx, 'genv, 'tcx> {
     fn confirm_candidate(
         &mut self,
         candidate: Candidate,
-        obligation: &AliasTy,
+        obligation: &AliasTerm,
     ) -> QueryResult<SubsetTyCtor> {
         let tcx = self.tcx();
         match candidate {
@@ -196,15 +194,22 @@ impl<'a, 'infcx, 'genv, 'tcx> Normalizer<'a, 'infcx, 'genv, 'tcx> {
                 }
             }
             Candidate::UserDefinedImpl(impl_def_id) => {
-                // Given a projection obligation
-                //     <IntoIter<{v. i32[v] | v > 0}, Global> as Iterator>::Item
+                // Given a projection obligation on a generic associated type
+                //     <Wrapper<bool> as Container>::Item<'r, i32[1]>
                 // and the id of a rust impl block
-                //     impl<T, A: Allocator> Iterator for IntoIter<T, A>
+                //     impl<T> Container for Wrapper<T> {
+                //         type Item<'a, U> = (&'a T, U);
+                //     }
+                //
+                // The obligation's args are the trait's args followed by the GAT's own args:
+                //     [Wrapper<bool>, 'r, i32[1]]
+                //      ^^^^^^^^^^^^^  ^^^^^^^^^^
+                //      trait args     GAT args
 
                 // 1. MATCH the self type of the rust impl block and the flux self type of the obligation
                 //    to infer a substitution
-                //        IntoIter<{v. i32[v] | v > 0}, Global> MATCH IntoIter<T, A>
-                //            => {T -> {v. i32[v] | v > 0}, A -> Global}
+                //        Wrapper<bool> MATCH Wrapper<T>
+                //            => {T -> bool}
 
                 let impl_trait_ref = self.genv().impl_trait_ref(impl_def_id)?.skip_binder();
 
@@ -218,13 +223,26 @@ impl<'a, 'infcx, 'genv, 'tcx> Normalizer<'a, 'infcx, 'genv, 'tcx> {
                 // 2. Gather the ProjectionPredicates and solve them see issue-808.rs
                 self.resolve_projection_predicates(&mut subst, impl_def_id)?;
 
-                let args = subst.finish(self.tcx(), generics)?;
+                let mut args = subst.finish(self.tcx(), generics)?;
 
-                // 3. Get the associated type in the impl block and apply the substitution to it
+                // 3. Append the GAT's own args (those after the trait args in the obligation)
+                //        [bool] ++ ['r, i32[1]]
+                //            => [bool, 'r, i32[1]]
+                //    For non-generic associated types there are no leftover args.
+                args.extend(
+                    obligation
+                        .args
+                        .iter()
+                        .skip(impl_trait_ref.args.len())
+                        .cloned(),
+                );
+
+                // 4. Get the associated type in the impl block and apply the substitution to it
+                //        (&'a T, U) => (&'r bool, i32[1])
                 let assoc_type_id = tcx
                     .associated_items(impl_def_id)
                     .in_definition_order()
-                    .find(|item| item.trait_item_def_id() == Some(obligation.def_id))
+                    .find(|item| item.trait_item_def_id() == Some(obligation.def_id()))
                     .map(|item| item.def_id)
                     .ok_or_else(|| {
                         query_bug!("no associated type for {obligation:?} in impl {impl_def_id:?}")
@@ -241,7 +259,7 @@ impl<'a, 'infcx, 'genv, 'tcx> Normalizer<'a, 'infcx, 'genv, 'tcx> {
     fn fn_subtype_projection_ty(
         &mut self,
         actual: Binder<ProjectionPredicate>,
-        oblig: &AliasTy,
+        oblig: &AliasTerm,
     ) -> InferResult<SubsetTyCtor> {
         // Step 1: bs <- unpack(b1...)
         let obligs: Vec<_> = oblig
@@ -268,7 +286,7 @@ impl<'a, 'infcx, 'genv, 'tcx> Normalizer<'a, 'infcx, 'genv, 'tcx> {
                 )
                 .deeply_normalize(infcx)?;
 
-            let actuals = actual.projection_ty.args.iter().map(|arg| {
+            let actuals = actual.projection_term.args.iter().map(|arg| {
                 match arg {
                     GenericArg::Base(ctor) => GenericArg::Ty(ctor.to_ty()),
                     _ => arg.clone(),
@@ -293,7 +311,7 @@ impl<'a, 'infcx, 'genv, 'tcx> Normalizer<'a, 'infcx, 'genv, 'tcx> {
         let oblig_term = actual.term.with_holes().replace_holes(|binders, kind| {
             assert!(kind == rty::HoleKind::Pred);
             let scope = &self.scope;
-            infcx.fresh_kvar_in_scope(binders, scope, KVarEncoding::Conj)
+            infcx.fresh_kvar_in_scope(binders, scope)
         });
 
         // Step 6: subtyping obligation on output
@@ -309,7 +327,7 @@ impl<'a, 'infcx, 'genv, 'tcx> Normalizer<'a, 'infcx, 'genv, 'tcx> {
     fn assemble_candidates_from_predicates(
         &mut self,
         predicates: &List<Clause>,
-        obligation: &AliasTy,
+        obligation: &AliasTerm,
         ctor: fn(Binder<ProjectionPredicate>) -> Candidate,
         candidates: &mut Vec<Candidate>,
     ) {
@@ -318,7 +336,7 @@ impl<'a, 'infcx, 'genv, 'tcx> Normalizer<'a, 'infcx, 'genv, 'tcx> {
 
         for predicate in predicates {
             if let Some(pred) = predicate.as_projection_clause()
-                && pred.skip_binder_ref().projection_ty.to_rustc(tcx) == rustc_obligation
+                && pred.skip_binder_ref().projection_term.to_rustc(tcx) == rustc_obligation
             {
                 candidates.push(ctor(pred));
             }
@@ -327,7 +345,7 @@ impl<'a, 'infcx, 'genv, 'tcx> Normalizer<'a, 'infcx, 'genv, 'tcx> {
 
     fn assemble_candidates_from_param_env(
         &mut self,
-        obligation: &AliasTy,
+        obligation: &AliasTerm,
         candidates: &mut Vec<Candidate>,
     ) {
         let predicates = self.param_env.clone();
@@ -341,14 +359,15 @@ impl<'a, 'infcx, 'genv, 'tcx> Normalizer<'a, 'infcx, 'genv, 'tcx> {
 
     fn assemble_candidates_from_trait_def(
         &mut self,
-        obligation: &AliasTy,
+        obligation: &AliasTerm,
         candidates: &mut Vec<Candidate>,
     ) -> InferResult {
         if let GenericArg::Base(ctor) = &obligation.args[0]
-            && let BaseTy::Alias(AliasKind::Opaque, alias_ty) = ctor.as_bty_skipping_binder()
+            && let BaseTy::Alias(alias_ty @ AliasTy { kind: AliasKind::Opaque { def_id }, .. }) =
+                ctor.as_bty_skipping_binder()
         {
             debug_assert!(!alias_ty.has_escaping_bvars());
-            let bounds = self.genv().item_bounds(alias_ty.def_id)?.instantiate(
+            let bounds = self.genv().item_bounds(*def_id)?.instantiate(
                 self.tcx(),
                 &alias_ty.args,
                 &alias_ty.refine_args,
@@ -365,7 +384,7 @@ impl<'a, 'infcx, 'genv, 'tcx> Normalizer<'a, 'infcx, 'genv, 'tcx> {
 
     fn assemble_candidates_from_impls(
         &mut self,
-        obligation: &AliasTy,
+        obligation: &AliasTerm,
         candidates: &mut Vec<Candidate>,
     ) -> QueryResult {
         let trait_ref = obligation.to_rustc(self.tcx()).trait_ref(self.tcx());
@@ -413,13 +432,13 @@ impl FallibleTypeFolder for Normalizer<'_, '_, '_, '_> {
 
     fn try_fold_sort(&mut self, sort: &Sort) -> Result<Sort, Self::Error> {
         match sort {
-            Sort::Alias(AliasKind::Free, alias_ty) => {
+            Sort::Alias(AliasTy { kind: AliasKind::Free { def_id }, args, refine_args }) => {
                 self.genv()
-                    .normalize_free_alias_sort(alias_ty)?
+                    .normalize_free_alias_sort(*def_id, args, refine_args)?
                     .try_fold_with(self)
             }
-            Sort::Alias(AliasKind::Projection, alias_ty) => {
-                let (changed, ctor) = self.normalize_projection_ty(alias_ty)?;
+            Sort::Alias(alias_ty @ AliasTy { kind: AliasKind::Projection { .. }, .. }) => {
+                let (changed, ctor) = self.normalize_projection_ty(&alias_ty.to_alias_term())?;
                 let sort = ctor.sort();
                 if changed { sort.try_fold_with(self) } else { Ok(sort) }
             }
@@ -434,16 +453,22 @@ impl FallibleTypeFolder for Normalizer<'_, '_, '_, '_> {
     // is for.
     fn try_fold_ty(&mut self, ty: &Ty) -> Result<Ty, Self::Error> {
         match ty.kind() {
-            TyKind::Indexed(BaseTy::Alias(AliasKind::Free, alias_ty), idx) => {
+            TyKind::Indexed(
+                BaseTy::Alias(AliasTy { kind: AliasKind::Free { def_id }, args, refine_args }),
+                idx,
+            ) => {
                 Ok(self
                     .genv()
-                    .type_of(alias_ty.def_id)?
-                    .instantiate(self.tcx(), &alias_ty.args, &alias_ty.refine_args)
+                    .type_of(*def_id)?
+                    .instantiate(self.tcx(), args, refine_args)
                     .expect_ctor()
                     .replace_bound_reft(idx))
             }
-            TyKind::Indexed(BaseTy::Alias(AliasKind::Projection, alias_ty), idx) => {
-                let (changed, ctor) = self.normalize_projection_ty(alias_ty)?;
+            TyKind::Indexed(
+                BaseTy::Alias(alias_ty @ AliasTy { kind: AliasKind::Projection { .. }, .. }),
+                idx,
+            ) => {
+                let (changed, ctor) = self.normalize_projection_ty(&alias_ty.to_alias_term())?;
                 let ty = ctor.replace_bound_reft(idx).to_ty();
                 if changed { ty.try_fold_with(self) } else { Ok(ty) }
             }
@@ -453,15 +478,15 @@ impl FallibleTypeFolder for Normalizer<'_, '_, '_, '_> {
 
     fn try_fold_subset_ty(&mut self, sty: &SubsetTy) -> Result<SubsetTy, Self::Error> {
         match &sty.bty {
-            BaseTy::Alias(AliasKind::Free, _alias_ty) => {
+            BaseTy::Alias(AliasTy { kind: AliasKind::Free { .. }, .. }) => {
                 // Weak aliases are always expanded during conversion. We could in theory normalize
                 // them here but we don't guaranatee that type aliases expand to a subset ty. If we
                 // ever stop expanding aliases during conv we would need to guarantee that aliases
                 // used as a generic base expand to a subset type.
                 tracked_span_bug!()
             }
-            BaseTy::Alias(AliasKind::Projection, alias_ty) => {
-                let (changed, ctor) = self.normalize_projection_ty(alias_ty)?;
+            BaseTy::Alias(alias_ty @ AliasTy { kind: AliasKind::Projection { .. }, .. }) => {
+                let (changed, ctor) = self.normalize_projection_ty(&alias_ty.to_alias_term())?;
                 let ty = ctor.replace_bound_reft(&sty.idx).strengthen(&sty.pred);
                 if changed { ty.try_fold_with(self) } else { Ok(ty) }
             }
@@ -574,17 +599,17 @@ impl FallibleTypeFolder for SortNormalizer<'_, '_, '_> {
     type Error = QueryErr;
     fn try_fold_sort(&mut self, sort: &Sort) -> Result<Sort, Self::Error> {
         match sort {
-            Sort::Alias(AliasKind::Free, alias_ty) => {
+            Sort::Alias(AliasTy { kind: AliasKind::Free { def_id }, args, refine_args }) => {
                 self.genv
-                    .normalize_free_alias_sort(alias_ty)?
+                    .normalize_free_alias_sort(*def_id, args, refine_args)?
                     .try_fold_with(self)
             }
-            Sort::Alias(AliasKind::Projection, alias_ty) => {
+            Sort::Alias(alias_ty @ AliasTy { kind: AliasKind::Projection { .. }, .. }) => {
                 let (changed, ctor) = normalize_projection_ty_with_rustc(
                     self.genv,
                     self.def_id,
                     self.infcx,
-                    alias_ty,
+                    &alias_ty.to_alias_term(),
                 )?;
                 let sort = ctor.sort();
                 if changed { sort.try_fold_with(self) } else { Ok(sort) }
@@ -734,20 +759,27 @@ fn normalize_projection_ty_with_rustc<'tcx>(
     genv: GlobalEnv<'_, 'tcx>,
     def_id: DefId,
     infcx: &rustc_infer::infer::InferCtxt<'tcx>,
-    obligation: &AliasTy,
+    obligation: &AliasTerm,
 ) -> QueryResult<(bool, SubsetTyCtor)> {
     let tcx = genv.tcx();
-    let projection_ty = obligation.to_rustc(tcx);
+    let projection_ty = obligation.to_rustc(tcx).expect_ty();
     let projection_ty = tcx.erase_and_anonymize_regions(projection_ty);
     let cause = ObligationCause::dummy();
     let param_env = tcx.param_env(def_id);
 
-    let pre_ty = projection_ty.to_ty(tcx);
+    let pre_ty = projection_ty.to_ty(tcx, rustc_middle::ty::IsRigid::No);
     let at = infcx.at(&cause, param_env);
-    let ty = deeply_normalize::<rustc_middle::ty::Ty<'tcx>, FulfillmentError>(at, pre_ty)
-        .map_err(|err| query_bug!("{err:?}"))?;
+    let ty = deeply_normalize::<rustc_middle::ty::Ty<'tcx>, FulfillmentError>(
+        at,
+        rustc_middle::ty::Unnormalized::new(pre_ty),
+    )
+    .map_err(|err| query_bug!("{err:?}"))?;
 
-    let changed = pre_ty != ty;
+    // `deeply_normalize` marks aliases it couldn't reduce as `IsRigid::Yes`. Since `IsRigid` is
+    // part of `TyKind::Alias`, comparing the types directly would always report a change for rigid
+    // projections, so reset the flag on both sides before comparing.
+    let changed = rustc_middle::ty::set_aliases_to_non_rigid(tcx, ty).skip_normalization()
+        != rustc_middle::ty::set_aliases_to_non_rigid(tcx, pre_ty).skip_normalization();
     let rustc_ty = ty.lower(tcx).map_err(|reason| query_bug!("{reason:?}"))?;
 
     Ok((
@@ -827,11 +859,11 @@ fn normalize_alias_reft<'tcx>(
                 .apply(refine_args);
             Ok((true, e))
         }
-        Some(ImplSource::Builtin(BuiltinImplSource::Misc | BuiltinImplSource::Trivial, _)) => {
-            let e = genv
-                .builtin_assoc_reft_body(infcx.typing_env(param_env), alias_reft)
-                .apply(refine_args);
-            Ok((true, e))
+        Some(ImplSource::Builtin(BuiltinImplSource::Misc | BuiltinImplSource::Trivial, _))
+            if let Some(body) =
+                genv.builtin_assoc_reft_body(infcx.typing_env(param_env), alias_reft) =>
+        {
+            Ok((true, body.apply(refine_args)))
         }
         _ => Ok((false, Expr::alias(alias_reft.clone(), refine_args.clone()))),
     }

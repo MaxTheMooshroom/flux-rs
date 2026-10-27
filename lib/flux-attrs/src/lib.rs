@@ -35,6 +35,11 @@ pub fn reveal(attr: TokenStream, tokens: TokenStream) -> TokenStream {
 }
 
 #[proc_macro_attribute]
+pub fn hide(attr: TokenStream, tokens: TokenStream) -> TokenStream {
+    attr_impl::hide(attr, tokens)
+}
+
+#[proc_macro_attribute]
 pub fn refined_by(attr: TokenStream, tokens: TokenStream) -> TokenStream {
     attr_impl::refined_by(attr, tokens)
 }
@@ -177,6 +182,7 @@ mod attr_sysroot {
         sig,
         qualifiers,
         reveal,
+        hide,
         constant,
         invariant,
         opaque,
@@ -210,8 +216,8 @@ mod attr_dummy {
         TokenStream::new()
     }
 
-    pub fn extern_spec(_attrs: TokenStream, _tokens: TokenStream) -> TokenStream {
-        TokenStream::new()
+    pub fn extern_spec(attrs: TokenStream, tokens: TokenStream) -> TokenStream {
+        flux_attrs_impl::extern_spec_doc(attrs.into(), tokens.into()).into()
     }
 
     macro_rules! no_op {
@@ -231,6 +237,7 @@ mod attr_dummy {
         sig,
         qualifiers,
         reveal,
+        hide,
         invariant,
         constant,
         opaque,

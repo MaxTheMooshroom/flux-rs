@@ -8,10 +8,11 @@ mod binder;
 pub mod canonicalize;
 mod expr;
 pub mod fold;
-pub mod normalize;
 mod pretty;
+pub mod reduce;
 pub mod refining;
 pub mod region_matching;
+mod spec_func;
 pub mod subst;
 use std::{borrow::Cow, cmp::Ordering, fmt, hash::Hash, sync::LazyLock};
 
@@ -28,8 +29,8 @@ use flux_common::{bug, tracked_span_assert_eq, tracked_span_bug};
 use flux_config::OverflowMode;
 use flux_macros::{TypeFoldable, TypeVisitable};
 pub use flux_rustc_bridge::ty::{
-    AliasKind, BoundRegion, BoundRegionKind, BoundVar, Const, ConstKind, ConstVid, DebruijnIndex,
-    EarlyParamRegion, LateParamRegion, LateParamRegionKind,
+    AliasKind, AliasTermKind, BoundRegion, BoundRegionKind, BoundVar, Const, ConstKind, ConstVid,
+    DebruijnIndex, EarlyParamRegion, LateParamRegion, LateParamRegionKind,
     Region::{self, *},
     RegionVid,
 };
@@ -39,12 +40,11 @@ use flux_rustc_bridge::{
     ty::{self, GenericArgsExt as _, VariantDef},
 };
 use itertools::Itertools;
-pub use normalize::{FuncInfo, NormalizedDefns, local_deps};
-use refining::Refiner;
 use rustc_abi;
 pub use rustc_abi::{FIRST_VARIANT, VariantIdx};
+use rustc_attr_ir::LangItem;
 use rustc_data_structures::{fx::FxIndexMap, snapshot_map::SnapshotMap, unord::UnordMap};
-use rustc_hir::{LangItem, Safety, def_id::DefId};
+use rustc_hir::{Safety, def_id::DefId};
 use rustc_index::{IndexSlice, IndexVec, newtype_index};
 use rustc_macros::{Decodable, Encodable, TyDecodable, TyEncodable, extension};
 pub use rustc_middle::{
@@ -52,12 +52,13 @@ pub use rustc_middle::{
     ty::{AdtFlags, ClosureKind, FloatTy, IntTy, ParamConst, ParamTy, ScalarInt, UintTy},
 };
 use rustc_middle::{
-    query::IntoQueryParam,
+    query::IntoQueryKey,
     ty::{TyCtxt, fast_reject::SimplifiedType},
 };
 use rustc_span::{DUMMY_SP, Span, Symbol, sym, symbol::kw};
 use rustc_type_ir::Upcast as _;
 pub use rustc_type_ir::{INNERMOST, TyVid};
+pub use spec_func::{SpecFunc, SpecFuncs, deps};
 
 use self::fold::TypeFoldable;
 pub use crate::fhir::InferMode;
@@ -254,7 +255,9 @@ impl Generics {
         }
     }
 
-    pub fn const_params(&self, genv: GlobalEnv) -> QueryResult<Vec<(ParamConst, Sort)>> {
+    /// Returns the const generic params (including the parent's) together with their sort and
+    /// [`DefId`].
+    pub fn const_params(&self, genv: GlobalEnv) -> QueryResult<Vec<(ParamConst, Sort, DefId)>> {
         let mut res = vec![];
         for i in 0..self.count() {
             let param = self.param_at(i, genv)?;
@@ -262,7 +265,7 @@ impl Generics {
                 && let Some(sort) = genv.sort_of_def_id(param.def_id)?
             {
                 let param_const = ParamConst { name: param.name, index: param.index };
-                res.push((param_const, sort));
+                res.push((param_const, sort, param.def_id));
             }
         }
         Ok(res)
@@ -460,10 +463,10 @@ pub type TypeOutlivesPredicate = OutlivesPredicate<Ty>;
 pub type RegionOutlivesPredicate = OutlivesPredicate<Region>;
 
 impl<'tcx, V: ToRustc<'tcx>> ToRustc<'tcx> for OutlivesPredicate<V> {
-    type T = rustc_middle::ty::OutlivesPredicate<'tcx, V::T>;
+    type T = rustc_middle::ty::OutlivesClause<'tcx, V::T>;
 
     fn to_rustc(&self, tcx: TyCtxt<'tcx>) -> Self::T {
-        rustc_middle::ty::OutlivesPredicate(self.0.to_rustc(tcx), self.1.to_rustc(tcx))
+        rustc_middle::ty::OutlivesClause(self.0.to_rustc(tcx), self.1.to_rustc(tcx))
     }
 }
 
@@ -481,11 +484,11 @@ impl TraitPredicate {
 }
 
 impl<'tcx> ToRustc<'tcx> for TraitPredicate {
-    type T = rustc_middle::ty::TraitPredicate<'tcx>;
+    type T = rustc_middle::ty::TraitClause<'tcx>;
 
     fn to_rustc(&self, tcx: TyCtxt<'tcx>) -> Self::T {
-        rustc_middle::ty::TraitPredicate {
-            polarity: rustc_middle::ty::PredicatePolarity::Positive,
+        rustc_middle::ty::TraitClause {
+            polarity: rustc_middle::ty::ClausePolarity::Positive,
             trait_ref: self.trait_ref.to_rustc(tcx),
         }
     }
@@ -623,7 +626,7 @@ pub struct ExistentialProjection {
     PartialEq, Eq, Hash, Debug, Clone, TyEncodable, TyDecodable, TypeVisitable, TypeFoldable,
 )]
 pub struct ProjectionPredicate {
-    pub projection_ty: AliasTy,
+    pub projection_term: AliasTerm,
     pub term: SubsetTyCtor,
 }
 
@@ -631,28 +634,24 @@ impl Pretty for ProjectionPredicate {
     fn fmt(&self, _cx: &PrettyCx, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "ProjectionPredicate << projection_ty = {:?}, term = {:?} >>",
-            self.projection_ty, self.term
+            "ProjectionPredicate << projection_term = {:?}, term = {:?} >>",
+            self.projection_term, self.term
         )
     }
 }
 
 impl ProjectionPredicate {
     pub fn self_ty(&self) -> SubsetTyCtor {
-        self.projection_ty.self_ty().clone()
+        self.projection_term.self_ty().clone()
     }
 }
 
 impl<'tcx> ToRustc<'tcx> for ProjectionPredicate {
-    type T = rustc_middle::ty::ProjectionPredicate<'tcx>;
+    type T = rustc_middle::ty::ProjectionClause<'tcx>;
 
     fn to_rustc(&self, tcx: TyCtxt<'tcx>) -> Self::T {
-        rustc_middle::ty::ProjectionPredicate {
-            projection_term: rustc_middle::ty::AliasTerm::new_from_args(
-                tcx,
-                self.projection_ty.def_id,
-                self.projection_ty.args.to_rustc(tcx),
-            ),
+        rustc_middle::ty::ProjectionClause {
+            projection_term: self.projection_term.to_rustc(tcx),
             term: self.term.as_bty_skipping_binder().to_rustc(tcx).into(),
         }
     }
@@ -662,7 +661,7 @@ pub type PolyProjectionPredicate = Binder<ProjectionPredicate>;
 
 impl PolyProjectionPredicate {
     pub fn projection_def_id(&self) -> DefId {
-        self.skip_binder_ref().projection_ty.def_id
+        self.skip_binder_ref().projection_term.def_id()
     }
 
     pub fn self_ty(&self) -> Binder<SubsetTyCtor> {
@@ -1041,7 +1040,7 @@ pub enum Sort {
     Loc,
     Param(ParamTy),
     Tuple(List<Sort>),
-    Alias(AliasKind, AliasTy),
+    Alias(AliasTy),
     Func(PolyFuncSort),
     App(SortCtor, List<Sort>),
     Var(ParamSort),
@@ -1293,18 +1292,10 @@ pub enum ConstantInfo {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, TyEncodable, TyDecodable)]
-pub enum StaticInfo {
-    Unknown,
-    /// A static item whose type was specified by the user
-    Known(Ty),
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Hash, TyEncodable, TyDecodable)]
 pub struct AdtDef(Interned<AdtDefData>);
 
 #[derive(Debug, Eq, PartialEq, Hash, TyEncodable, TyDecodable)]
 pub struct AdtDefData {
-    invariants: Vec<Invariant>,
     sort_def: AdtSortDef,
     opaque: bool,
     rustc: ty::AdtDef,
@@ -1468,6 +1459,142 @@ pub struct PrimOpProp {
     pub body: Binder<Expr>,
 }
 
+/// An `Axiom` is a (global) fact, typically about uninterpreted functions, that is assumed to
+/// hold for all values of the variables bound in `body`.
+#[derive(TypeVisitable, TypeFoldable)]
+pub struct Axiom {
+    pub def_id: FluxLocalDefId,
+    pub body: Binder<AxiomBody>,
+}
+
+/// The variable (by its position in the axiom's binder) that does not occur in any pattern of an
+/// ill-formed axiom. See [`Axiom::new`].
+#[derive(Debug, Clone, Copy)]
+pub struct UncoveredAxiomVar(pub BoundVar);
+
+#[derive(Debug, TypeVisitable, TypeFoldable)]
+pub struct AxiomBody {
+    pub expr: Expr,
+    /// The terms used as the pattern (trigger) to instantiate the axiom: *each* application of an
+    /// uninterpreted function occurring in `expr`. See [`Axiom::new`].
+    pub patterns: List<Expr>,
+}
+
+impl Axiom {
+    /// Creates an axiom, computing its patterns from `body`, which must have already been
+    /// [reduced] so that the applications are the ones that will be sent to the solver.
+    ///
+    /// A function is considered uninterpreted if it has no body or if it is hidden. We also
+    /// include the arithmetic and bitwise operations that can be encoded as UIFs (e.g.,
+    /// `[&](x, y)` on `int`, or `x * y` under `uif_ops`), the casts that have no interpretation,
+    /// and associated refinements. (Whether a hidden function is revealed, or an operation is
+    /// uninterpreted, depends on the item being checked, so those are *candidates* that are
+    /// filtered when encoding the axiom.) Applications mentioning variables bound *inside* the body (by
+    /// a `let` or a quantifier) are skipped as they are not valid outside of their binder.
+    ///
+    /// [reduced]: fold::TypeFoldable::reduce
+    ///
+    /// Fails if some variable bound by the axiom does not occur in any of the patterns, as the
+    /// axiom could then never be instantiated.
+    pub fn new(
+        genv: GlobalEnv,
+        def_id: FluxLocalDefId,
+        body: Binder<Expr>,
+    ) -> Result<Self, UncoveredAxiomVar> {
+        use fold::{TypeSuperVisitable as _, TypeVisitable as _};
+
+        struct Collector<'genv, 'tcx> {
+            genv: GlobalEnv<'genv, 'tcx>,
+            /// Number of binders we are currently under
+            depth: usize,
+            /// Total number of binders entered so far
+            binders: usize,
+            patterns: Vec<Expr>,
+        }
+
+        impl Collector<'_, '_> {
+            fn is_uif_app(&self, expr: &Expr) -> bool {
+                match expr.kind() {
+                    ExprKind::App(func, sort_args, _) => {
+                        match func.kind() {
+                            ExprKind::GlobalFunc(SpecFuncKind::Def(did)) => {
+                                matches!(
+                                    self.genv.spec_func(*did),
+                                    SpecFunc::Uif | SpecFunc::Defined { hide: true, .. }
+                                )
+                            }
+                            ExprKind::InternalFunc(InternalFuncKind::Cast) => {
+                                matches!(
+                                    &sort_args[..],
+                                    [SortArg::Sort(from), SortArg::Sort(to)]
+                                        if matches!(from.cast_kind(to), CastKind::Uninterpreted)
+                                )
+                            }
+                            _ => false,
+                        }
+                    }
+                    // An operation that *may* be encoded as a UIF, e.g., `[&](x, y)` or `x * y`
+                    ExprKind::BinaryOp(op, ..) => op.uif_sort().is_some(),
+                    ExprKind::Alias(..) => true,
+                    _ => false,
+                }
+            }
+        }
+
+        impl fold::TypeVisitor for Collector<'_, '_> {
+            fn enter_binder(&mut self, _vars: &BoundVariableKinds) {
+                self.depth += 1;
+                self.binders += 1;
+            }
+
+            fn exit_binder(&mut self) {
+                self.depth -= 1;
+            }
+
+            fn visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<!> {
+                let binders = self.binders;
+                expr.super_visit_with(self)?;
+                // Skip applications under a binder or containing one
+                if self.depth == 0 && self.binders == binders && self.is_uif_app(expr) {
+                    let expr = expr.erase_spans();
+                    if !self.patterns.contains(&expr) {
+                        self.patterns.push(expr);
+                    }
+                }
+                std::ops::ControlFlow::Continue(())
+            }
+        }
+
+        /// Marks the variables of the axiom's binder that occur in a pattern. Patterns never
+        /// contain binders, so the axiom's variables are exactly those at [`INNERMOST`].
+        struct CoverChecker(Vec<bool>);
+
+        impl fold::TypeVisitor for CoverChecker {
+            fn visit_expr(&mut self, expr: &Expr) -> std::ops::ControlFlow<!> {
+                if let ExprKind::Var(Var::Bound(INNERMOST, BoundReft { var, .. })) = expr.kind() {
+                    self.0[var.as_usize()] = true;
+                }
+                expr.super_visit_with(self)
+            }
+        }
+
+        let mut collector = Collector { genv, depth: 0, binders: 0, patterns: vec![] };
+        let _ = body.skip_binder_ref().visit_with(&mut collector);
+
+        // Every variable of the axiom must occur in some pattern, otherwise the solver
+        // cannot instantiate it.
+        let mut checker = CoverChecker(vec![false; body.vars().len()]);
+        let _ = collector.patterns.visit_with(&mut checker);
+        if let Some(idx) = checker.0.iter().position(|covered| !covered) {
+            return Err(UncoveredAxiomVar(BoundVar::from_usize(idx)));
+        }
+
+        let patterns = List::from_vec(collector.patterns);
+        let body = body.map(|expr| AxiomBody { expr, patterns });
+        Ok(Axiom { def_id, body })
+    }
+}
+
 #[derive(Debug, TypeVisitable, TypeFoldable)]
 pub struct PrimRel {
     pub body: Binder<Expr>,
@@ -1613,22 +1740,6 @@ impl Ty {
         let bty = BaseTy::adt(adt_def, args);
         Ok(Ty::indexed(bty, Expr::unit_struct(def_id)))
     }
-
-    pub fn mk_box_with_default_alloc(genv: GlobalEnv, deref_ty: Ty) -> QueryResult<Ty> {
-        let def_id = genv.tcx().require_lang_item(LangItem::OwnedBox, DUMMY_SP);
-
-        let generics = genv.generics_of(def_id)?;
-        let alloc_ty = genv
-            .lower_type_of(generics.own_params[1].def_id)?
-            .skip_binder();
-        let alloc_ty = Refiner::default_for_item(genv, def_id)?.refine_generic_arg(
-            &generics.own_params[1],
-            &flux_rustc_bridge::ty::GenericArg::Ty(alloc_ty),
-        )?;
-
-        Ty::mk_box(genv, deref_ty, alloc_ty)
-    }
-
     pub fn tuple(tys: impl Into<List<Ty>>) -> Ty {
         BaseTy::Tuple(tys.into()).to_ty()
     }
@@ -1717,6 +1828,12 @@ impl Ty {
     pub fn is_struct(&self) -> bool {
         self.as_bty_skipping_existentials()
             .map(BaseTy::is_struct)
+            .unwrap_or_default()
+    }
+
+    pub fn is_raw_ptr(&self) -> bool {
+        self.as_bty_skipping_existentials()
+            .map(BaseTy::is_raw_ptr)
             .unwrap_or_default()
     }
 
@@ -1852,7 +1969,7 @@ pub enum BaseTy {
     FnPtr(PolyFnSig),
     FnDef(DefId, GenericArgs),
     Tuple(List<Ty>),
-    Alias(AliasKind, AliasTy),
+    Alias(AliasTy),
     Array(Ty, Const),
     Never,
     Closure(DefId, /* upvar_tys */ List<Ty>, flux_rustc_bridge::ty::GenericArgs, bool),
@@ -1870,14 +1987,6 @@ pub enum BaseTy {
 }
 
 impl BaseTy {
-    pub fn opaque(alias_ty: AliasTy) -> BaseTy {
-        BaseTy::Alias(AliasKind::Opaque, alias_ty)
-    }
-
-    pub fn projection(alias_ty: AliasTy) -> BaseTy {
-        BaseTy::Alias(AliasKind::Projection, alias_ty)
-    }
-
     pub fn adt(adt_def: AdtDef, args: GenericArgs) -> BaseTy {
         BaseTy::Adt(adt_def, args)
     }
@@ -1993,22 +2102,31 @@ impl BaseTy {
         matches!(self, BaseTy::Str)
     }
 
+    pub fn is_raw_ptr(&self) -> bool {
+        matches!(self, BaseTy::RawPtr(..))
+    }
+
     pub fn invariants(
         &self,
-        tcx: TyCtxt,
+        genv: GlobalEnv,
         overflow_mode: OverflowMode,
-    ) -> impl Iterator<Item = Invariant> {
-        let (invariants, args) = match self {
-            BaseTy::Adt(adt_def, args) => (adt_def.invariants().skip_binder(), &args[..]),
-            BaseTy::Uint(uint_ty) => (uint_invariants(*uint_ty, overflow_mode), &[][..]),
-            BaseTy::Int(int_ty) => (int_invariants(*int_ty, overflow_mode), &[][..]),
-            BaseTy::Char => (char_invariants(), &[][..]),
-            BaseTy::Slice(_) => (slice_invariants(overflow_mode), &[][..]),
-            _ => (&[][..], &[][..]),
-        };
-        invariants
-            .iter()
-            .map(move |inv| EarlyBinder(inv).instantiate_ref(tcx, args, &[]))
+    ) -> std::vec::IntoIter<Invariant> {
+        match self {
+            BaseTy::Adt(adt_def, args) => {
+                genv.invariants_of(adt_def.did())
+                    .as_deref()
+                    .iter_identity()
+                    .map(|inv| EarlyBinder(inv).instantiate_ref(genv.tcx(), args, &[]))
+                    .collect()
+            }
+            BaseTy::Uint(uint_ty) => uint_invariants(*uint_ty, overflow_mode).to_vec(),
+            BaseTy::Int(int_ty) => int_invariants(*int_ty, overflow_mode).to_vec(),
+            BaseTy::Char => char_invariants().to_vec(),
+            BaseTy::Slice(ty) => slice_invariants(genv, ty, overflow_mode),
+            BaseTy::RawPtr(..) => raw_ptr_invariants().to_vec(),
+            _ => vec![],
+        }
+        .into_iter()
     }
 
     pub fn to_ty(&self) -> Ty {
@@ -2123,7 +2241,7 @@ impl<'tcx> ToRustc<'tcx> for BaseTy {
             }
             BaseTy::FnDef(def_id, args) => {
                 let args = args.to_rustc(tcx);
-                ty::Ty::new_fn_def(tcx, *def_id, args)
+                tcx.type_of(*def_id).instantiate(tcx, args).skip_norm_wip()
             }
             BaseTy::Float(f) => ty::Ty::new_float(tcx, *f),
             BaseTy::RawPtr(ty, mutbl) => ty::Ty::new_ptr(tcx, ty.to_rustc(tcx), *mutbl),
@@ -2135,8 +2253,8 @@ impl<'tcx> ToRustc<'tcx> for BaseTy {
                 let ts = tys.iter().map(|ty| ty.to_rustc(tcx)).collect_vec();
                 ty::Ty::new_tup(tcx, &ts)
             }
-            BaseTy::Alias(kind, alias_ty) => {
-                ty::Ty::new_alias(tcx, kind.to_rustc(tcx), alias_ty.to_rustc(tcx))
+            BaseTy::Alias(alias_ty) => {
+                ty::Ty::new_alias(tcx, ty::IsRigid::No, alias_ty.to_rustc(tcx))
             }
             BaseTy::Array(ty, n) => {
                 let ty = ty.to_rustc(tcx);
@@ -2174,15 +2292,66 @@ impl<'tcx> ToRustc<'tcx> for BaseTy {
     Clone, PartialEq, Eq, Hash, Debug, TyEncodable, TyDecodable, TypeVisitable, TypeFoldable,
 )]
 pub struct AliasTy {
-    pub def_id: DefId,
+    pub kind: AliasKind,
     pub args: GenericArgs,
     /// Holds the refinement-arguments for opaque-types; empty for projections
     pub refine_args: RefineArgs,
 }
 
 impl AliasTy {
-    pub fn new(def_id: DefId, args: GenericArgs, refine_args: RefineArgs) -> Self {
-        AliasTy { args, refine_args, def_id }
+    pub fn new(kind: AliasKind, args: GenericArgs, refine_args: RefineArgs) -> Self {
+        AliasTy { kind, args, refine_args }
+    }
+
+    pub fn to_alias_term(&self) -> AliasTerm {
+        let kind = match self.kind {
+            AliasKind::Projection { def_id } => AliasTermKind::ProjectionTy { def_id },
+            AliasKind::Opaque { def_id } => AliasTermKind::OpaqueTy { def_id },
+            AliasKind::Free { def_id } => AliasTermKind::FreeTy { def_id },
+        };
+        AliasTerm::new(kind, self.args.clone())
+    }
+}
+
+/// Mirrors [`flux_rustc_bridge::ty::AliasTerm`].
+#[derive(
+    Clone, PartialEq, Eq, Hash, Debug, TyEncodable, TyDecodable, TypeVisitable, TypeFoldable,
+)]
+pub struct AliasTerm {
+    pub kind: AliasTermKind,
+    pub args: GenericArgs,
+}
+
+impl AliasTerm {
+    pub fn new(kind: AliasTermKind, args: GenericArgs) -> Self {
+        AliasTerm { kind, args }
+    }
+
+    pub fn def_id(&self) -> DefId {
+        self.kind.def_id()
+    }
+
+    pub fn to_alias_ty(&self) -> AliasTy {
+        let kind = match self.kind {
+            AliasTermKind::ProjectionTy { def_id } => AliasKind::Projection { def_id },
+            AliasTermKind::OpaqueTy { def_id } => AliasKind::Opaque { def_id },
+            AliasTermKind::FreeTy { def_id } => AliasKind::Free { def_id },
+        };
+        AliasTy::new(kind, self.args.clone(), List::empty())
+    }
+
+    pub fn self_ty(&self) -> SubsetTyCtor {
+        self.args[0].expect_base().clone()
+    }
+
+    pub fn with_self_ty(&self, self_ty: SubsetTyCtor) -> Self {
+        Self {
+            kind: self.kind,
+            args: [GenericArg::Base(self_ty)]
+                .into_iter()
+                .chain(self.args.iter().skip(1).cloned())
+                .collect(),
+        }
     }
 }
 
@@ -2194,7 +2363,7 @@ impl AliasTy {
 
     pub fn with_self_ty(&self, self_ty: SubsetTyCtor) -> Self {
         Self {
-            def_id: self.def_id,
+            kind: self.kind,
             args: [GenericArg::Base(self_ty)]
                 .into_iter()
                 .chain(self.args.iter().skip(1).cloned())
@@ -2204,11 +2373,27 @@ impl AliasTy {
     }
 }
 
+impl<'tcx> ToRustc<'tcx> for AliasTerm {
+    type T = rustc_middle::ty::AliasTerm<'tcx>;
+
+    fn to_rustc(&self, tcx: TyCtxt<'tcx>) -> Self::T {
+        rustc_middle::ty::AliasTerm::new_from_args(
+            tcx,
+            self.kind.to_rustc_kind(),
+            self.args.to_rustc(tcx),
+        )
+    }
+}
+
 impl<'tcx> ToRustc<'tcx> for AliasTy {
     type T = rustc_middle::ty::AliasTy<'tcx>;
 
     fn to_rustc(&self, tcx: TyCtxt<'tcx>) -> Self::T {
-        rustc_middle::ty::AliasTy::new(tcx, self.def_id, self.args.to_rustc(tcx))
+        rustc_middle::ty::AliasTy::new_from_args(
+            tcx,
+            self.kind.to_rustc_kind(),
+            self.args.to_rustc(tcx),
+        )
     }
 }
 
@@ -2760,9 +2945,10 @@ impl<'tcx> ToRustc<'tcx> for FnSig {
         tcx.mk_fn_sig(
             self.inputs().iter().map(|ty| ty.to_rustc(tcx)),
             self.output().as_ref().skip_binder().to_rustc(tcx),
-            false,
-            self.safety,
-            self.abi,
+            rustc_middle::ty::FnSigKind::default()
+                .set_abi(self.abi)
+                .set_safety(self.safety)
+                .set_c_variadic(false),
         )
     }
 }
@@ -2782,13 +2968,8 @@ impl<'tcx> ToRustc<'tcx> for FnOutput {
 }
 
 impl AdtDef {
-    pub fn new(
-        rustc: ty::AdtDef,
-        sort_def: AdtSortDef,
-        invariants: Vec<Invariant>,
-        opaque: bool,
-    ) -> Self {
-        AdtDef(Interned::new(AdtDefData { invariants, sort_def, opaque, rustc }))
+    pub fn new(rustc: ty::AdtDef, sort_def: AdtSortDef, opaque: bool) -> Self {
+        AdtDef(Interned::new(AdtDefData { sort_def, opaque, rustc }))
     }
 
     pub fn did(&self) -> DefId {
@@ -2825,10 +3006,6 @@ impl AdtDef {
 
     pub fn variant(&self, idx: VariantIdx) -> &VariantDef {
         self.0.rustc.variant(idx)
-    }
-
-    pub fn invariants(&self) -> EarlyBinder<&[Invariant]> {
-        EarlyBinder(&self.0.invariants)
     }
 
     pub fn discriminants(&self) -> impl Iterator<Item = (VariantIdx, u128)> + '_ {
@@ -2872,29 +3049,61 @@ impl TyKind {
     }
 }
 
-/// returns the same invariants as for `usize` which is the length of a slice
-fn slice_invariants(overflow_mode: OverflowMode) -> &'static [Invariant] {
-    static DEFAULT: LazyLock<[Invariant; 1]> = LazyLock::new(|| {
-        [Invariant { pred: Binder::bind_with_sort(Expr::ge(Expr::nu(), Expr::zero()), Sort::Int) }]
-    });
-    static OVERFLOW: LazyLock<[Invariant; 2]> = LazyLock::new(|| {
-        [
-            Invariant {
-                pred: Binder::bind_with_sort(Expr::ge(Expr::nu(), Expr::zero()), Sort::Int),
-            },
-            Invariant {
-                pred: Binder::bind_with_sort(
-                    Expr::le(Expr::nu(), Expr::uint_max(UintTy::Usize)),
-                    Sort::Int,
-                ),
-            },
-        ]
-    });
-    if matches!(overflow_mode, OverflowMode::Strict | OverflowMode::Lazy) {
-        &*OVERFLOW
-    } else {
-        &*DEFAULT
+/// All slices have 0 <= len <= usize::MAX, with the upper bound subject to overflow checking.
+///
+/// Also subject to overflow checking, slices have len * T::size_of() <=
+/// isize::MAX (see [`std::slice::from_raw_parts`]).
+///   
+/// While this holds for all slices, the above condition reduces to true for ZST
+/// slices, so we omit it. Additionally, for ZST slices, the usize::MAX upper
+/// bound is redundant, so we omit it.
+///
+/// [`std::slice::from_raw_parts`]:
+/// https://doc.rust-lang.org/std/slice/fn.from_raw_parts.html
+fn slice_invariants(genv: GlobalEnv, elem_ty: &Ty, overflow_mode: OverflowMode) -> Vec<Invariant> {
+    let mut invariants = vec![Invariant {
+        pred: Binder::bind_with_sort(Expr::ge(Expr::nu(), Expr::zero()), Sort::Int),
+    }];
+    if !matches!(
+        overflow_mode,
+        OverflowMode::Strict | OverflowMode::Lazy | OverflowMode::StrictUnder
+    ) {
+        return invariants;
     }
+
+    let sized_id = genv.tcx().require_lang_item(LangItem::Sized, DUMMY_SP);
+    let size_of = Expr::alias(
+        AliasReft {
+            assoc_id: genv.require_builtin_assoc_reft(sized_id, sym::size_of),
+            args: List::from_arr([GenericArg::Base(
+                elem_ty
+                    .with_holes()
+                    .replace_holes(|_, _| Expr::tt())
+                    .as_bty_skipping_existentials()
+                    .expect("slice element type must have a base type")
+                    .to_subset_ty_ctor(),
+            )]),
+        },
+        List::empty(),
+    );
+    // T::size_of() * len <= isize::MAX
+    invariants.push(Invariant {
+        pred: Binder::bind_with_sort(
+            Expr::le(
+                Expr::binary_op(BinOp::Mul(Sort::Int), Expr::nu(), size_of),
+                Expr::int_max(IntTy::Isize),
+            ),
+            Sort::Int,
+        ),
+    });
+    // len <= usize::MAX (only relevant for ZSTs)
+    invariants.push(Invariant {
+        pred: Binder::bind_with_sort(
+            Expr::le(Expr::nu(), Expr::uint_max(UintTy::Usize)),
+            Sort::Int,
+        ),
+    });
+    invariants
 }
 
 fn uint_invariants(uint_ty: UintTy, overflow_mode: OverflowMode) -> &'static [Invariant] {
@@ -2921,11 +3130,35 @@ fn uint_invariants(uint_ty: UintTy, overflow_mode: OverflowMode) -> &'static [In
             })
             .collect()
     });
-    if matches!(overflow_mode, OverflowMode::Strict | OverflowMode::Lazy) {
+    if matches!(
+        overflow_mode,
+        OverflowMode::Strict | OverflowMode::Lazy | OverflowMode::StrictUnder
+    ) {
         &OVERFLOW[&uint_ty]
     } else {
         &*DEFAULT
     }
+}
+
+fn raw_ptr_invariants() -> &'static [Invariant] {
+    fn field(field: RawPtrField) -> Expr {
+        Expr::nu().proj_and_reduce(FieldProj::RawPtr { field })
+    }
+
+    static INVARIANTS: LazyLock<[Invariant; 4]> = LazyLock::new(|| {
+        let base = field(RawPtrField::Base);
+        let addr = field(RawPtrField::Addr);
+        let size = field(RawPtrField::Size);
+        let max = Expr::uint_max(UintTy::Usize);
+        [
+            Expr::ge(base, Expr::zero()),
+            Expr::ge(&addr, Expr::zero()),
+            Expr::le(&addr, &max),
+            Expr::le(addr + size, max),
+        ]
+        .map(|pred| Invariant { pred: Binder::bind_with_sort(pred, Sort::RawPtr) })
+    });
+    &*INVARIANTS
 }
 
 fn char_invariants() -> &'static [Invariant] {
@@ -2976,7 +3209,10 @@ fn int_invariants(int_ty: IntTy, overflow_mode: OverflowMode) -> &'static [Invar
             })
             .collect()
     });
-    if matches!(overflow_mode, OverflowMode::Strict | OverflowMode::Lazy) {
+    if matches!(
+        overflow_mode,
+        OverflowMode::Strict | OverflowMode::Lazy | OverflowMode::StrictUnder
+    ) {
         &OVERFLOW[&int_ty]
     } else {
         &DEFAULT
@@ -3203,7 +3439,7 @@ fn can_auto_strong(fn_sig: &PolyFnSig) -> bool {
 ///     forall<l0: Loc>. fn (x: &strg<l0:InnerTy>) -> bool ensures l0:InnerTy
 pub fn auto_strong(
     genv: GlobalEnv,
-    def_id: impl IntoQueryParam<DefId>,
+    def_id: impl IntoQueryKey<DefId>,
     fn_sig: PolyFnSig,
 ) -> PolyFnSig {
     // TODO(auto-strong): we only *really* need the first check `can_auto_strong` here.

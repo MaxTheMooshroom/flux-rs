@@ -438,7 +438,7 @@ fn mk_rem_rules() -> RuleMatcher<2> {
 /// `a & b`
 fn mk_bit_and_rules() -> RuleMatcher<2> {
     primop_rules! {
-        fn(a: T, b: T) -> { T[E::prim_val(BitAnd(Sort::Int), a, b)] | E::prim_rel(BitAnd(Sort::Int), a, b) }
+        fn(a: T, b: T) -> { T[E::binary_op(BitAnd(Sort::Int), a, b)] | E::prim_rel(BitAnd(Sort::Int), a, b) }
         if T.is_integral()
 
         fn(a: bool, b: bool) -> bool[E::and(a, b)]
@@ -448,7 +448,7 @@ fn mk_bit_and_rules() -> RuleMatcher<2> {
 /// `a | b`
 fn mk_bit_or_rules() -> RuleMatcher<2> {
     primop_rules! {
-        fn(a: T, b: T) -> { T[E::prim_val(BitOr(Sort::Int), a, b)] | E::prim_rel(BitOr(Sort::Int), a, b) }
+        fn(a: T, b: T) -> { T[E::binary_op(BitOr(Sort::Int), a, b)] | E::prim_rel(BitOr(Sort::Int), a, b) }
         if T.is_integral()
 
         fn(a: bool, b: bool) -> bool[E::or(a, b)]
@@ -458,18 +458,23 @@ fn mk_bit_or_rules() -> RuleMatcher<2> {
 /// `a ^ b`
 fn mk_bit_xor_rules() -> RuleMatcher<2> {
     primop_rules! {
-        fn(a: T, b: T) -> { T[E::prim_val(BitXor(Sort::Int), a, b)] | E::prim_rel(BitXor(Sort::Int), a, b) }
+        fn(a: T, b: T) -> { T[E::binary_op(BitXor(Sort::Int), a, b)] | E::prim_rel(BitXor(Sort::Int), a, b) }
         if T.is_integral()
     }
 }
 
 // the (a: T, b: S) case ensures the last case is "unreachable", hence the "allow"
+// raw pointers may have slightly different types, but we still want to compare their addresses
 #[allow(unreachable_code)]
 /// `a == b`
 fn mk_eq_rules() -> RuleMatcher<2> {
     primop_rules! {
         fn(a: T, b: T) -> bool[E::eq(a, b)]
         if T.is_integral() || T.is_bool() || T.is_char() || T.is_str()
+
+        fn(a: T, b: S) -> bool[E::eq(a.reduce_ptr_addr(), b.reduce_ptr_addr())]
+        if T.is_raw_ptr() && S.is_raw_ptr()
+
         fn(a: T, b: S) -> bool
     }
 }
@@ -481,6 +486,9 @@ fn mk_ne_rules() -> RuleMatcher<2> {
         fn(a: T, b: T) -> bool[E::ne(a, b)]
         if T.is_integral() || T.is_bool()
 
+        fn(a: T, b: S) -> bool[E::ne(a.reduce_ptr_addr(), b.reduce_ptr_addr())]
+        if T.is_raw_ptr() && S.is_raw_ptr()
+
         fn(a: T, b: S) -> bool
     }
 }
@@ -491,6 +499,9 @@ fn mk_le_rules() -> RuleMatcher<2> {
     primop_rules! {
         fn(a: T, b: T) -> bool[E::le(a, b)]
         if T.is_integral()
+
+        fn(a: T, b: S) -> bool[E::le(a.reduce_ptr_addr(), b.reduce_ptr_addr())]
+        if T.is_raw_ptr() && S.is_raw_ptr()
 
         fn(a: bool, b: bool) -> bool[E::implies(a, b)]
 
@@ -505,6 +516,9 @@ fn mk_ge_rules() -> RuleMatcher<2> {
         fn(a: T, b: T) -> bool[E::ge(a, b)]
         if T.is_integral()
 
+        fn(a: T, b: S) -> bool[E::ge(a.reduce_ptr_addr(), b.reduce_ptr_addr())]
+        if T.is_raw_ptr() && S.is_raw_ptr()
+
         fn(a: bool, b: bool) -> bool[E::implies(b, a)]
 
         fn(a: T, b: S) -> bool
@@ -517,6 +531,9 @@ fn mk_lt_rules() -> RuleMatcher<2> {
     primop_rules! {
         fn(a: T, b: T) -> bool[E::lt(a, b)]
         if T.is_integral()
+
+        fn(a: T, b: S) -> bool[E::lt(a.reduce_ptr_addr(), b.reduce_ptr_addr())]
+        if T.is_raw_ptr() && S.is_raw_ptr()
 
         fn(a: bool, b: bool) -> bool[E::and(a.not(), b)]
 
@@ -531,6 +548,9 @@ fn mk_gt_rules() -> RuleMatcher<2> {
         fn(a: T, b: T) -> bool[E::gt(a, b)]
         if T.is_integral()
 
+        fn(a: T, b: S) -> bool[E::gt(a.reduce_ptr_addr(), b.reduce_ptr_addr())]
+        if T.is_raw_ptr() && S.is_raw_ptr()
+
         fn(a: bool, b: bool) -> bool[E::and(a, b.not())]
 
         fn(a: T, b: S) -> bool
@@ -540,7 +560,7 @@ fn mk_gt_rules() -> RuleMatcher<2> {
 /// `a << b`
 fn mk_shl_rules() -> RuleMatcher<2> {
     primop_rules! {
-        fn(a: T, b: S) -> { T[E::prim_val(BitShl(Sort::Int), a, b)] | E::prim_rel(BitShl(Sort::Int), a, b) }
+        fn(a: T, b: S) -> { T[E::binary_op(BitShl(Sort::Int), a, b)] | E::prim_rel(BitShl(Sort::Int), a, b) }
         if T.is_integral() && S.is_integral()
     }
 }
@@ -548,7 +568,7 @@ fn mk_shl_rules() -> RuleMatcher<2> {
 /// `a >> b`
 fn mk_shr_rules() -> RuleMatcher<2> {
     primop_rules! {
-        fn(a: T, b: S) -> { T[E::prim_val(BitShr(Sort::Int), a, b)] | E::prim_rel(BitShr(Sort::Int), a, b) }
+        fn(a: T, b: S) -> { T[E::binary_op(BitShr(Sort::Int), a, b)] | E::prim_rel(BitShr(Sort::Int), a, b) }
         if T.is_integral() && S.is_integral()
     }
 }

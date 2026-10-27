@@ -9,13 +9,13 @@ use std::{
 use flux_common::bug;
 use flux_errors::FluxSession;
 use rustc_data_structures::{fx::FxHashMap, sync::HashMapExt};
-use rustc_hir::def_id::DefId;
-use rustc_middle::{
-    implement_ty_decoder,
-    ty::{self, TyCtxt, codec::TyDecoder},
+use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_middle::ty::{
+    self, TyCtxt,
+    codec::{TyDecoder, forward_all_decoder_methods_to},
 };
 use rustc_serialize::{
-    Decodable, Decoder as _,
+    Decodable, Decoder,
     opaque::{IntEncodedWithFixedSize, MemDecoder},
 };
 use rustc_session::StableCrateId;
@@ -27,8 +27,8 @@ use rustc_span::{
 };
 
 use crate::{
-    AbsoluteBytePos, CrateMetadata, EncodedSourceFileId, Footer, METADATA_HEADER, SYMBOL_OFFSET,
-    SYMBOL_PREDEFINED, SYMBOL_STR, SourceFileIndex, TAG_FULL_SPAN, TAG_PARTIAL_SPAN,
+    AbsoluteBytePos, CrateMetadata, EncodedSourceFileId, ExpnKey, Footer, METADATA_HEADER,
+    SYMBOL_OFFSET, SYMBOL_PREDEFINED, SYMBOL_STR, SourceFileIndex, TAG_FULL_SPAN, TAG_PARTIAL_SPAN,
 };
 
 struct DecodeContext<'a, 'tcx> {
@@ -37,7 +37,7 @@ struct DecodeContext<'a, 'tcx> {
     file_index_to_file: FxHashMap<SourceFileIndex, Arc<SourceFile>>,
     file_index_to_stable_id: FxHashMap<SourceFileIndex, EncodedSourceFileId>,
     syntax_contexts: &'a FxHashMap<u32, AbsoluteBytePos>,
-    expn_data: FxHashMap<(StableCrateId, u32), AbsoluteBytePos>,
+    expn_data: FxHashMap<ExpnKey, AbsoluteBytePos>,
     hygiene_context: &'a HygieneDecodeContext,
 }
 
@@ -121,7 +121,9 @@ fn catch_decode<R>(decode: impl FnOnce() -> R) -> Result<R, ()> {
     result.map_err(|_| ())
 }
 
-implement_ty_decoder!(DecodeContext<'a, 'tcx>);
+impl Decoder for DecodeContext<'_, '_> {
+    forward_all_decoder_methods_to!(|self| self.opaque);
+}
 
 impl BlobDecoder for DecodeContext<'_, '_> {
     fn decode_symbol(&mut self) -> Symbol {
@@ -157,6 +159,10 @@ impl BlobDecoder for DecodeContext<'_, '_> {
     fn decode_def_index(&mut self) -> DefIndex {
         DefIndex::from_u32(self.read_u32())
     }
+
+    fn decode_local_def_id(&mut self) -> LocalDefId {
+        bug!("flux metadata never encodes a `LocalDefId`")
+    }
 }
 
 impl SpanDecoder for DecodeContext<'_, '_> {
@@ -189,7 +195,7 @@ impl SpanDecoder for DecodeContext<'_, '_> {
         let index = u32::decode(self);
 
         rustc_span::hygiene::decode_expn_id(cnum, index, |_| {
-            let pos = self.expn_data.get(&(stable_id, index)).unwrap();
+            let pos = self.expn_data.get(&ExpnKey(stable_id, index)).unwrap();
             self.with_position(pos.to_usize(), |decoder| {
                 let data = rustc_span::ExpnData::decode(decoder);
                 let hash = rustc_span::ExpnHash::decode(decoder);
@@ -219,12 +225,16 @@ impl SpanDecoder for DecodeContext<'_, '_> {
     }
 }
 
-impl<'tcx> TyDecoder<'tcx> for DecodeContext<'_, 'tcx> {
-    const CLEAR_CROSS_CRATE: bool = true;
+impl<'tcx> rustc_type_ir::InternerDecoder for DecodeContext<'_, 'tcx> {
+    type Interner = TyCtxt<'tcx>;
 
     fn interner(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
+}
+
+impl<'tcx> TyDecoder<'tcx> for DecodeContext<'_, 'tcx> {
+    const CLEAR_CROSS_CRATE: bool = true;
 
     fn cached_ty_for_shorthand<F>(&mut self, shorthand: usize, or_insert_with: F) -> ty::Ty<'tcx>
     where
@@ -234,13 +244,13 @@ impl<'tcx> TyDecoder<'tcx> for DecodeContext<'_, 'tcx> {
 
         let cache_key = ty::CReaderCacheKey { cnum: None, pos: shorthand };
 
-        if let Some(&ty) = tcx.ty_rcache.borrow().get(&cache_key) {
+        if let Some(&ty) = tcx.caches.ty_rcache.borrow().get(&cache_key) {
             return ty;
         }
 
         let ty = or_insert_with(self);
         // This may overwrite the entry, but it should overwrite with the same value.
-        tcx.ty_rcache.borrow_mut().insert_same(cache_key, ty);
+        tcx.caches.ty_rcache.borrow_mut().insert_same(cache_key, ty);
         ty
     }
 
@@ -267,7 +277,7 @@ mod errors {
     use flux_macros::Diagnostic;
 
     #[derive(Diagnostic)]
-    #[diag(metadata_decode_file_error, code = E0999)]
+    #[diag("error when decoding flux metadata file {$path}: {$err}", code = E0999)]
     pub(super) struct DecodeFileError<'a> {
         path: &'a Path,
         err: io::Error,
@@ -280,7 +290,7 @@ mod errors {
     }
 
     #[derive(Diagnostic)]
-    #[diag(metadata_incompatible_metadata, code = E0999)]
+    #[diag("failed to decode flux metadata file `{$path}`; this is likely because it was produced by an incompatible version of flux. Run `cargo clean` to remove stale metadata and try again", code = E0999)]
     pub(super) struct IncompatibleMetadata<'a> {
         path: &'a Path,
     }
